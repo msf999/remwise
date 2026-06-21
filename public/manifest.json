@@ -1,0 +1,28 @@
+{
+  "manifestVersion": 1,
+  "id": "remwise-mo",
+  "name": "Remwise",
+  "author": "Mo9",
+  "repoUrl": "https://github.com/msf999/remwise",
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "theme": [],
+  "enableOnMobile": false,
+  "unlisted": true,
+  "description": "Sync your tagged Readwise highlights into RemNote — a curated, add-only import with per-source metadata, Reader inbox/archive location, and a preview-then-apply sync popup.",
+  "requestNative": false,
+  "requiredScopes": [
+    {
+      "type": "All",
+      "level": "ReadCreateModify"
+    },
+    {
+      "type": "DescendantsOfName",
+      "remName": "Readwise",
+      "level": "ReadCreateModifyDelete"
+    }
+  ]
+}

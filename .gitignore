@@ -1,0 +1,18 @@
+node_modules
+.DS_Store
+dist
+dist-ssr
+*.local
+*.zip
+
+# Reference material only — not part of the build, excluded from git.
+Information/
+
+# Machine-local Claude Code settings (permissions etc.) — not shared.
+.claude/
+
+# Project dev guide — synced across machines via iCloud, kept out of git.
+CLAUDE.md
+
+# Built plugin bundle (already matched by *.zip above; listed explicitly too).
+PluginZip.zip

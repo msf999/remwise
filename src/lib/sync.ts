@@ -20,6 +20,13 @@ import type { ReaderInfo, ReadwiseHighlight, ReadwiseSource } from './types/read
 
 const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
+/** Yield to the macrotask queue so the plugin-widget iframe can paint, run GC, and answer the host's
+ *  liveness pings BETWEEN apply items. Without this a large apply is one tight burst of thousands of
+ *  SDK round-trips and the iframe can exhaust its renderer-process memory → the browser kills the frame
+ *  (the grey "sad tab" crash seen on big syncs). A macrotask (setTimeout) — not a microtask — is what
+ *  actually lets the event loop breathe between items. */
+const yieldToHost = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
 // ───────────────────────── Plan types ─────────────────────────
 
 /** One source-metadata field whose Readwise value differs from what's stored on the doc. */
@@ -1013,6 +1020,7 @@ export async function applySyncPlan(
       log?.log('apply', `UPDATE FAILED for ${entry.name}: ${errMsg(err)}`);
       onItemDone(entry.id, false);
     }
+    await yieldToHost(); // let the widget iframe paint/GC between items (avoids the OOM frame-crash)
   }
 
   for (const { entry, highlightIds } of selection.toAddHighlights) {
@@ -1030,6 +1038,7 @@ export async function applySyncPlan(
       log?.log('apply', `ADD-HIGHLIGHTS FAILED for ${entry.name}: ${errMsg(err)}`);
       onItemDone(entry.id, false);
     }
+    await yieldToHost(); // let the widget iframe paint/GC between items (avoids the OOM frame-crash)
   }
 
   if (selection.toCreateSources.length) {
@@ -1044,6 +1053,7 @@ export async function applySyncPlan(
         log?.log('apply', `CREATE FAILED for ${entry.name}: ${errMsg(err)}`);
         onItemDone(entry.id, false);
       }
+      await yieldToHost(); // let the widget iframe paint/GC between items (avoids the OOM frame-crash)
     }
   }
 

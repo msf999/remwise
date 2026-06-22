@@ -370,6 +370,12 @@ export const ReadwiseSync = () => {
   const addLeafIds = plan ? plan.toAddHighlights.flatMap((e) => e.highlights.map((h) => `${e.id}:${h.id}`)) : [];
 
   const pct = progress && progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
+  // While an apply is in flight, hide the (potentially 1000+ row) results list. Re-rendering that whole
+  // tree on every applied item — on top of the apply's own thousands of SDK calls — can exhaust the
+  // plugin-widget iframe's renderer memory, and the browser kills the frame (the grey "sad tab" crash on
+  // big syncs). During apply we render only a compact progress panel; the full list returns with ✅/❌
+  // once `applied` flips true. (Preview keeps `plan` null, so this is false then.)
+  const applying = !!plan && busy && !applied;
 
   return (
     <div
@@ -485,7 +491,17 @@ export const ReadwiseSync = () => {
 
       {/* Body */}
       <div style={{ flex: 1, overflow: 'auto', padding: '0 16px 16px 16px' }}>
-        {plan && (
+        {plan && applying && (
+          <div style={{ padding: '12px 4px', color: '#374151' }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Applying changes…</div>
+            <div style={{ fontSize: 13, color: '#6b7280' }}>
+              {done.size} done{failed.size ? ` · ${failed.size} failed` : ''}. The detailed list is hidden while
+              applying to keep the popup light (a big sync can otherwise exhaust the popup’s memory and the
+              browser closes it) — it reappears with ✅/❌ when finished.
+            </div>
+          </div>
+        )}
+        {plan && !applying && (
           <>
             <Section keyName="create" title="Will create (sources)" count={plan.toCreateSources.length} leafIds={createLeafIds}>
               {createGroups.map(([cat, entries]) => (

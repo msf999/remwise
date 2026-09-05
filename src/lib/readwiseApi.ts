@@ -3,7 +3,7 @@
  * Readwise responds with permissive CORS, so no client library or proxy is needed. Auth is the same
  * `Authorization: Token <token>` header for both APIs. The v2 export gives books + highlights; the v3
  * Reader list gives the inbox/archive `location` (and the Reader URL), joined to v2 books by
- * `external_id` (present only when `source === 'reader'`).
+ * `external_id` (present only when `source === 'reader'`). Every fetch is a FULL fetch (no delta mode).
  */
 import type { RNPlugin } from '@remnote/plugin-sdk';
 import { CATEGORIES, type Category, categorySettingId, COLOR_MAP, SETTINGS } from './consts';
@@ -41,7 +41,31 @@ export function isToastedError(e: unknown): boolean {
   return !!e && typeof e === 'object' && (e as { toasted?: boolean }).toasted === true;
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** True for an abort (the popup was closed mid-fetch) — from `fetch` itself or from `sleep`. */
+export function isAbortError(e: unknown): boolean {
+  return !!e && typeof e === 'object' && (e as { name?: string }).name === 'AbortError';
+}
+
+const abortError = (): Error => {
+  const e = new Error('Fetch cancelled');
+  e.name = 'AbortError';
+  return e;
+};
+
+/** Sleep `ms`, rejecting immediately with an AbortError if `signal` aborts first. */
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(abortError());
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 
 /** Read + validate the Readwise token. Throws (after a toast) if missing. */
 async function readToken(plugin: RNPlugin, log?: SyncLog): Promise<string> {
@@ -56,30 +80,49 @@ async function readToken(plugin: RNPlugin, log?: SyncLog): Promise<string> {
   return token;
 }
 
-/** Verify a token via `GET /api/v2/auth/` (204 ok / 401 bad). Returns true/false; never throws. */
-export async function verifyToken(token: string): Promise<boolean> {
+/** Outcome of an open-time token check. `unreachable` says nothing about the token itself. */
+export type TokenCheck = 'ok' | 'invalid' | 'unreachable';
+
+/**
+ * Verify a token via `GET /api/v2/auth/` (204 ok / 401 bad). Only a 401/403 means the token is
+ * wrong; being offline, a 429, or a 5xx is reported as `unreachable` so a valid token is never
+ * called invalid. Never throws.
+ */
+export async function verifyToken(token: string): Promise<TokenCheck> {
   try {
     const res = await fetch(V2_AUTH, { headers: { Authorization: `Token ${token.trim()}` } });
-    return res.status === 204 || res.ok;
+    if (res.status === 204 || res.ok) return 'ok';
+    if (res.status === 401 || res.status === 403) return 'invalid';
+    return 'unreachable';
   } catch {
-    return false;
+    return 'unreachable';
   }
+}
+
+interface GetOpts {
+  /** Aborting it cancels the request (and any backoff sleep) with an AbortError. */
+  signal?: AbortSignal;
+  /** Toast a non-OK failure before throwing (default true). Best-effort callers that surface the
+   *  error themselves pass false, so the user doesn't see a scary toast for a non-fatal problem. */
+  toast?: boolean;
 }
 
 /**
  * GET a URL with the Readwise auth header, honoring 429 `Retry-After` (in SECONDS — multiply by 1000)
  * by sleeping then re-issuing the SAME request, capped at `MAX_RETRIES`. 401 → toasted + thrown; other
- * non-OK → toasted + thrown. Returns the parsed JSON.
+ * non-OK → toasted + thrown (unless `toast:false`). Returns the parsed JSON.
  */
 async function getJson<T>(
   plugin: RNPlugin,
   url: string,
   token: string,
   scope: string,
-  log?: SyncLog
+  log?: SyncLog,
+  opts: GetOpts = {}
 ): Promise<T> {
+  const { signal, toast = true } = opts;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, { headers: { Authorization: `Token ${token}` } });
+    const res = await fetch(url, { headers: { Authorization: `Token ${token}` }, signal });
     if (res.ok) return (await res.json()) as T;
     if (res.status === 429 && attempt < MAX_RETRIES) {
       const retryAfter = Number.parseInt(res.headers.get('Retry-After') ?? '', 10);
@@ -87,36 +130,39 @@ async function getJson<T>(
       // the API's rolling 1-minute window.
       const waitMs = (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : (attempt + 1) * 8) * 1000;
       log?.log(scope, `Rate limited (429); retry ${attempt + 1}/${MAX_RETRIES} after ${waitMs}ms.`);
-      await sleep(waitMs);
+      await sleep(waitMs, signal);
       continue;
     }
     const msg =
       res.status === 401
         ? 'Readwise rejected the token (HTTP 401). Check it in the plugin settings.'
-        : `Readwise request failed: HTTP ${res.status} ${res.statusText}.`;
+        : res.status === 429
+          ? 'Readwise is rate-limiting requests (HTTP 429, retries exhausted) — wait a minute, then try again.'
+          : `Readwise request failed: HTTP ${res.status} ${res.statusText}.`;
     log?.log(scope, `ERROR: ${msg}`);
+    if (!toast) throw new Error(msg);
     await plugin.app.toast(msg);
     throw toastedError(msg);
   }
 }
 
 /**
- * Fetch every source (with its highlights) from the v2 export endpoint, paginating via
- * `nextPageCursor`. `updatedAfter` (ISO) limits to sources changed since then (passed only when the
- * `incremental` setting is on; dedup is always per-source via the ledger regardless). Calls
- * `onProgress` after each page; the first page's `count` is the library source total. Returns the full
- * source list plus that reported total (for the popup's truncation awareness).
+ * Fetch EVERY source (with its highlights) from the v2 export endpoint, paginating via
+ * `nextPageCursor`. Calls `onProgress` after each page; the first page's `count` is the library source
+ * total. Returns the full source list plus that reported total. Throws on failure (toasted) or abort.
  */
 export async function fetchExport(
   plugin: RNPlugin,
-  opts: { updatedAfter?: string; onProgress?: FetchProgressFn; log?: SyncLog }
+  opts: { onProgress?: FetchProgressFn; log?: SyncLog; signal?: AbortSignal }
 ): Promise<{ sources: ReadwiseSource[]; reportedTotal: number }> {
-  const { updatedAfter, onProgress, log } = opts;
+  const { onProgress, log, signal } = opts;
   const token = await readToken(plugin, log);
   log?.section('Fetch from Readwise (v2 export)');
-  log?.log('fetch', updatedAfter ? `Incremental — changes since ${updatedAfter}.` : 'Full export.');
+  log?.log('fetch', 'Full export.');
 
-  const sources: ReadwiseSource[] = [];
+  // Keyed by user_book_id: a book whose highlights span pages is returned ONCE PER PAGE, and two entries
+  // for one book would become two create rows sharing a single selection id — one tick, two documents.
+  const byBookId = new Map<number, ReadwiseSource>();
   let highlightCount = 0;
   let reportedTotal = 0;
   let cursor: string | null = null;
@@ -125,46 +171,63 @@ export async function fetchExport(
   while (true) {
     const params = new URLSearchParams();
     if (cursor) params.append('pageCursor', cursor);
-    if (updatedAfter) params.append('updatedAfter', updatedAfter);
     page += 1;
     const data = await getJson<ReadwiseExportPage>(
       plugin,
       `${V2_EXPORT}?${params.toString()}`,
       token,
       'fetch',
-      log
+      log,
+      { signal }
     );
     if (page === 1) reportedTotal = data.count ?? 0;
     for (const s of data.results ?? []) {
-      sources.push(s);
       highlightCount += s.highlights?.length ?? 0;
+      const prev = byBookId.get(s.user_book_id);
+      if (prev) prev.highlights = [...(prev.highlights ?? []), ...(s.highlights ?? [])];
+      else byBookId.set(s.user_book_id, s);
     }
-    onProgress?.(sources.length, highlightCount, reportedTotal);
-    log?.log('fetch', `Page ${page}: +${data.results?.length ?? 0} sources (total ${sources.length}).`);
+    onProgress?.(byBookId.size, highlightCount, reportedTotal);
+    log?.log('fetch', `Page ${page}: +${data.results?.length ?? 0} sources (total ${byBookId.size}).`);
     cursor = data.nextPageCursor ?? null;
     if (!cursor) break;
   }
 
+  const sources = [...byBookId.values()];
   log?.log('fetch', `Fetched ${sources.length} source(s), ${highlightCount} highlight(s).`);
   return { sources, reportedTotal };
 }
 
+/** Result of the Reader sweep. `complete:false` = it stopped early; `docs` holds what was collected. */
+export interface ReaderFetchResult {
+  /** Reader doc id → { location, url, sourceUrl }. */
+  docs: Map<string, ReaderInfo>;
+  /** True only when every page was fetched — the plan may then treat "not in the map" as "not in Reader". */
+  complete: boolean;
+  /** Why it stopped early (for the popup's warning line). */
+  error?: string;
+}
+
 /**
- * Fetch Reader (v3) documents and return a `Reader doc id → { location, url, sourceUrl }` map.
- * Same auth + same 429 backoff as v2; `updatedAfter` (ISO) limits to recently-changed Reader docs
- * (passed only when `incremental` is on). The Reader API is 20 req/min, so we pace pages ~1 per 3.2s —
- * a full sweep of a large library takes a while. Best-effort: a failure logs and returns whatever was
- * collected (location is enrichment, not core data).
+ * Fetch ALL Reader (v3) documents and return a `Reader doc id → { location, url, sourceUrl }` map.
+ * Same auth + same 429 backoff as v2. The Reader API is 20 req/min, so we pace pages ~1 per 3.2s —
+ * a full sweep of a large library takes a while. Best-effort: a failure logs, does NOT toast, and
+ * returns whatever was collected flagged `complete:false` (location is enrichment, not core data) —
+ * the popup shows a warning and the plan leaves unmapped sources' locations untouched. An abort
+ * (popup closed) is re-thrown so the whole preview stops.
  */
 export async function fetchReaderDocs(
   plugin: RNPlugin,
-  opts: { updatedAfter?: string; onProgress?: (count: number) => void; log?: SyncLog }
-): Promise<Map<string, ReaderInfo>> {
-  const { updatedAfter, onProgress, log } = opts;
-  const out = new Map<string, ReaderInfo>();
-  const token = (await plugin.settings.getSetting<string>(SETTINGS.apiKey))?.trim();
-  if (!token) return out;
+  opts: { onProgress?: (count: number) => void; log?: SyncLog; signal?: AbortSignal }
+): Promise<ReaderFetchResult> {
+  const { onProgress, log, signal } = opts;
+  const docs = new Map<string, ReaderInfo>();
   log?.section('Fetch from Readwise Reader (v3 list)');
+  const token = (await plugin.settings.getSetting<string>(SETTINGS.apiKey))?.trim();
+  if (!token) {
+    log?.log('fetch', 'Reader fetch skipped: no token set.');
+    return { docs, complete: false, error: 'no token set' };
+  }
   let cursor: string | null = null;
   let page = 0;
   try {
@@ -172,30 +235,36 @@ export async function fetchReaderDocs(
       const params = new URLSearchParams();
       params.append('limit', '100');
       if (cursor) params.append('pageCursor', cursor);
-      if (updatedAfter) params.append('updatedAfter', updatedAfter);
       page += 1;
       const data = await getJson<ReaderListPage>(
         plugin,
         `${V3_LIST}?${params.toString()}`,
         token,
         'fetch',
-        log
+        log,
+        { signal, toast: false }
       );
       for (const d of data.results ?? []) {
-        if (d.id) out.set(d.id, { location: d.location, url: d.url, sourceUrl: d.source_url });
+        if (d.id) docs.set(d.id, { location: d.location, url: d.url, sourceUrl: d.source_url });
       }
-      onProgress?.(out.size);
-      log?.log('fetch', `Reader page ${page}: +${data.results?.length ?? 0} docs (total ${out.size}).`);
+      onProgress?.(docs.size);
+      log?.log('fetch', `Reader page ${page}: +${data.results?.length ?? 0} docs (total ${docs.size}).`);
       cursor = data.nextPageCursor ?? null;
       if (!cursor) break;
-      await sleep(READER_PAGE_DELAY_MS); // throttle: stay under the 20 req/min Reader limit
+      await sleep(READER_PAGE_DELAY_MS, signal); // throttle: stay under the 20 req/min Reader limit
     }
   } catch (err) {
+    if (isAbortError(err)) throw err; // the popup closed — stop the whole preview, not just this sweep
     // Reader location is enrichment — never let a v3 failure abort the whole sync.
-    log?.log('fetch', `Reader fetch stopped early (${err instanceof Error ? err.message : String(err)}).`);
+    const msg = err instanceof Error ? err.message : String(err);
+    log?.log(
+      'fetch',
+      `Reader fetch stopped early (${msg}) — ${docs.size} doc(s) mapped; locations of unmapped sources are left unchanged this run.`
+    );
+    return { docs, complete: false, error: msg };
   }
-  log?.log('fetch', `Reader docs mapped: ${out.size}.`);
-  return out;
+  log?.log('fetch', `Reader docs mapped: ${docs.size} (complete).`);
+  return { docs, complete: true };
 }
 
 /** Parse the comma-separated tag-filter setting into a trimmed, lowercased, de-duped list. */
@@ -243,14 +312,13 @@ export async function getIncludedCategories(plugin: RNPlugin): Promise<Set<Categ
 }
 
 /**
- * True if a source's category is included. `included` empty (all five unchecked) is treated as "all"
- * so a misconfiguration never silently syncs nothing. AND-combined with the tag filter at the
- * highlight level.
+ * True if a source's category is included. All five toggles OFF (`included` empty) means exactly
+ * what it says — nothing is included (the popup refuses to fetch and explains why). Sources with an
+ * unknown category value (shouldn't happen) pass through rather than get silently dropped.
  */
 export function matchesCategoryFilter(source: ReadwiseSource, included: Set<Category>): boolean {
-  if (included.size === 0) return true;
+  if (included.size === 0) return false;
   const cat = (source.category ?? '').trim().toLowerCase() as Category;
-  // Unknown categories (shouldn't happen) pass through rather than get silently dropped.
   if (!(CATEGORIES as readonly string[]).includes(cat)) return true;
   return included.has(cat);
 }

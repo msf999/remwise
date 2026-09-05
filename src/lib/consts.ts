@@ -1,18 +1,13 @@
 /** Shared identifiers used across registration and runtime so they never drift. */
 
-/** Plugin setting ids. */
+/** Plugin setting ids. Every sync is a FULL fetch — the former opt-in "Quick sync" delta mode
+ *  (`readwise-incremental` + a stored last-sync date) was removed on 2026-09-02; see CLAUDE.md. */
 export const SETTINGS = {
   apiKey: 'readwise-api-token',
   /** Comma-separated highlight tags to copy; empty = copy all. */
   tagFilter: 'readwise-tag-filter',
-  /** When ON, apply each highlight's Readwise color as a RemNote highlight color. */
+  /** When ON, apply each highlight's Readwise color as a RemNote highlight color. Default OFF. */
   applyColors: 'readwise-apply-colors',
-  /**
-   * When ON, fetch only sources changed since the stored last-sync date (fast). When OFF, fetch the
-   * whole library every time (use this while first working through your library — incremental can't
-   * resurface old items you haven't synced yet). Default OFF.
-   */
-  incremental: 'readwise-incremental',
   /**
    * When ON, enrol a source doc in Incremental Everything: every newly-created source, AND any
    * existing source not yet incremental that gains a new highlight on a later sync.
@@ -61,6 +56,33 @@ export const IE = {
   defaultRotation: 'Default',
 } as const;
 
+/**
+ * Document-title format. A source doc is named `Author - Title` so every author's works sort together
+ * (and the author is visible on the flashcard's source in the queue); a source with no author is just
+ * `Title`. Collisions escalate with the EM-DASH separator — `Author - Title — Category` →
+ * `Author - Title — [id]` — so a disambiguation suffix never looks like part of the author-title pair.
+ */
+export const AUTHOR_TITLE_SEP = ' - ';
+export const DISAMBIG_SEP = ' — ';
+
+/**
+ * Readwise's `supplementals` category (its curated popular highlights for a book). These are NOT given
+ * their own source document: their highlights live under a `Supplements` header inside the MAIN
+ * source's document (matched by title + author). Docs created for a supplemental by an older version
+ * are folded in by the one-time migration in the Sync popup.
+ */
+export const SUPPLEMENTAL_CATEGORY = 'supplementals';
+/** Name of the header-1 rem holding a source's supplemental highlights. */
+export const SUPPLEMENTS_HEADER = 'Supplements';
+/**
+ * Suffix for a SUPPLEMENT DOCUMENT — the holding pen for a supplemental whose main source isn't in
+ * RemNote yet. It keeps the highlights rather than dropping them; once the main source shows up, the
+ * sync stages a "Will merge" row that moves the bullets into its `Supplements` section and deletes the
+ * emptied document. Docs an older version created for every supplemental are the same thing and merge
+ * the same way.
+ */
+export const SUPPLEMENT_DOC_SUFFIX = ' - Supplement';
+
 /** Powerup that marks a Rem as a synced Readwise source and holds its metadata + dedup ledger. */
 export const SOURCE_POWERUP = 'readwise-source';
 
@@ -76,6 +98,12 @@ export const SOURCE_SLOTS = {
   // User-owned: created empty, never written/read/diffed by the plugin.
   tags: 'tags',
   // Hidden, plugin-owned.
+  /** The RAW url last written to the visible `link` slot. The visible slot holds a REFERENCE to a link
+   *  rem whose NAME can be a page title rather than the url (RemNote derives one), and such a rem is
+   *  not even tagged with the built-in Link powerup — so its url is unreadable and comparing the
+   *  resolved name against the url stages a "link" row that can never be satisfied. Diffing against
+   *  this stored copy instead is exact. Verified live 2026-09-05 on a title-named archive.org link. */
+  linkUrl: 'linkUrl',
   userBookId: 'userBookId',
   baseTitle: 'baseTitle',
   externalId: 'externalId',
@@ -84,18 +112,12 @@ export const SOURCE_SLOTS = {
 } as const;
 
 /**
- * Source fields the re-sync may refresh. `name` is the document TITLE (a `displayTitle`, reconciled
- * via `setText` — not a slot). All others are slots. `tags` is excluded (user-owned).
+ * Source fields the re-sync may refresh (diffed by `diffSource`, written by `applyUpdate`). `name` is
+ * the document TITLE (a `displayTitle`, reconciled via `setText` — not a slot); the rest are slots.
+ * `cover` + `readwiseUrl` are deliberately NOT here: they're written on create only (diffing
+ * images/link-rems causes phantom diffs). `tags` is user-owned and never touched.
  */
-export const SOURCE_UPDATABLE = [
-  'name',
-  'author',
-  'category',
-  'location',
-  'cover',
-  'link',
-  'readwiseUrl',
-] as const;
+export const SOURCE_UPDATABLE = ['name', 'author', 'category', 'location', 'link'] as const;
 export type UpdatableField = (typeof SOURCE_UPDATABLE)[number];
 
 /**
@@ -121,27 +143,24 @@ export const LOCATION_LABEL: Record<string, string> = {
 export const NOT_IN_READER = 'Not in Reader';
 
 /**
- * Readwise highlight `color` → RemNote highlight-color format token (a `RichTextFormatName`, which
- * accepts the RemColor names). RemNote has a real `Pink`, so every Readwise color maps 1:1. An
- * unknown/empty color → no formatting (plain text).
+ * Readwise highlight `color` → RemNote highlight-color format token (a `RichTextFormatName`).
+ *
+ * ⚠️ `pink → Red`, NOT `Pink`. `RemColor.Pink` exists in the SDK's TypeScript enum and `'Pink'` type-
+ * checks fine, but the host REJECTS it at runtime: `richText.applyTextFormatToRange` answers
+ * "Invalid Method Arguments … format parameter: Invalid input". Verified live 2026-09-05 by applying
+ * every name — Yellow/Blue/Orange/Green/Purple/Red all work, Pink alone throws. An earlier session
+ * "corrected" the original plan's `pink → Red` to `pink → Pink` on the strength of the enum alone and
+ * never ran it, which silently dropped every pink highlight (the throw skipped the whole bullet).
+ * Do NOT change this back without applying 'Pink' against a live host first.
  */
 export const COLOR_MAP: Record<string, string> = {
   yellow: 'Yellow',
   blue: 'Blue',
-  pink: 'Pink',
+  pink: 'Red',
   orange: 'Orange',
   green: 'Green',
   purple: 'Purple',
 };
-
-/**
- * Synced-storage keys (cross-device, plugin-writable — unlike settings, which the SDK can't write).
- * `lastSyncDate` is the ISO run-start time of the last successful Apply; used as `updatedAfter` only
- * when the `incremental` setting is ON. The "Reset last sync" command clears it (forces a full fetch).
- */
-export const STORAGE = {
-  lastSyncDate: 'readwise-last-sync-date',
-} as const;
 
 /** Widget file name (matches src/widgets/readwise_sync.tsx). */
 export const SYNC_WIDGET = 'readwise_sync';

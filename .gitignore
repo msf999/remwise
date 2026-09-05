@@ -16,3 +16,8 @@ CLAUDE.md
 
 # Built plugin bundle (already matched by *.zip above; listed explicitly too).
 PluginZip.zip
+
+# Local test suite + recorded results (not shipped)
+TESTPLAN.md
+TESTRESULTS.md
+scripts/

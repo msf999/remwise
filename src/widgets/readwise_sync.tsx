@@ -1,25 +1,28 @@
 import { renderWidget, usePlugin } from '@remnote/plugin-sdk';
 import { type CSSProperties, type ReactNode, useEffect, useRef, useState } from 'react';
-import { SETTINGS, STORAGE, type UpdatableField } from '../lib/consts';
+import { SETTINGS, type UpdatableField } from '../lib/consts';
 import { SyncLog } from '../lib/log';
 import {
   fetchExport,
   fetchReaderDocs,
   getIncludedCategories,
+  isAbortError,
   isToastedError,
   parseTagFilter,
   verifyToken,
 } from '../lib/readwiseApi';
 import {
+  applySupplementMigration,
   applySyncPlan,
   type ApplySelection,
   buildSyncContext,
   computeSyncPlan,
+  type MigrationPlan,
+  planSupplementMigration,
   type SourceCreateEntry,
   type SyncContext,
   type SyncPlan,
 } from '../lib/sync';
-import type { ReaderInfo } from '../lib/types/readwise';
 
 /** Copy text to the clipboard, falling back to a hidden textarea (the clipboard API can be blocked
  *  inside iframes). */
@@ -53,6 +56,8 @@ const clip = (s: string, n = 90): string => {
   return one.length > n ? one.slice(0, n - 1) + '…' : one;
 };
 
+const errText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
 const Check = (props: { checked: boolean; indeterminate?: boolean; disabled?: boolean; onChange: () => void }) => {
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -70,11 +75,83 @@ const Check = (props: { checked: boolean; indeterminate?: boolean; disabled?: bo
   );
 };
 
+// ── Module-level styles + Section ──────────────────────────────────────────────
+// `Section` MUST live outside `ReadwiseSync`: a component defined inside another component's body gets
+// a brand-new identity on every render, so React unmounts and remounts its entire subtree — here the
+// whole (possibly 1000+-row) preview list — on every checkbox click or status update. At module level
+// it is a stable type, so React reconciles the existing DOM in place (a re-render, not a remount).
+const rowStyle: CSSProperties = { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '3px 0' };
+const sectionStyle: CSSProperties = { border: '1px solid #e5e7eb', borderRadius: 8, marginBottom: 10 };
+const headerStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  padding: '8px 12px',
+  cursor: 'pointer',
+  fontWeight: 600,
+};
+const bodyStyle: CSSProperties = { padding: '4px 12px 10px 12px' };
+const smallBtn: CSSProperties = {
+  padding: '2px 8px',
+  borderRadius: 5,
+  border: '1px solid #d1d5db',
+  background: 'transparent',
+  color: 'inherit',
+  fontSize: 12,
+  cursor: 'pointer',
+};
+
+/** Select-all state for a section header; omitted for a read-only section. */
+interface SelectAll {
+  allOn: boolean;
+  someOn: boolean;
+  disabled: boolean;
+  onToggleAll: () => void;
+}
+
+const Section = (props: {
+  title: string;
+  count: number;
+  isOpen: boolean;
+  onToggle: () => void;
+  select?: SelectAll;
+  children: ReactNode;
+}) => {
+  if (props.count === 0) return null;
+  return (
+    <div style={sectionStyle}>
+      <div style={headerStyle} onClick={props.onToggle}>
+        <span style={{ width: 14 }}>{props.isOpen ? '▾' : '▸'}</span>
+        {props.select && (
+          <span onClick={(e) => e.stopPropagation()}>
+            <Check
+              checked={props.select.allOn}
+              indeterminate={props.select.someOn}
+              disabled={props.select.disabled}
+              onChange={props.select.onToggleAll}
+            />
+          </span>
+        )}
+        <span>
+          {props.title} ({props.count})
+        </span>
+      </div>
+      {props.isOpen && <div style={bodyStyle}>{props.children}</div>}
+    </div>
+  );
+};
+
 export const ReadwiseSync = () => {
   const plugin = usePlugin();
 
   const [status, setStatus] = useState('Ready. Click "Get from Readwise" to preview what will sync.');
+  /** A non-fatal problem worth keeping on screen (e.g. the Reader location sweep stopped early). */
+  const [warning, setWarning] = useState('');
   const [busy, setBusy] = useState(false);
+  /** True only while applySyncPlan is running — drives the compact panel that hides the big list. */
+  const [syncApplying, setSyncApplying] = useState(false);
+  /** True while the fallback migration is reparenting and deleting. */
+  const [migApplying, setMigApplying] = useState(false);
   const [applied, setApplied] = useState(false);
   const [plan, setPlan] = useState<SyncPlan | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -83,42 +160,59 @@ export const ReadwiseSync = () => {
   const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set(['already', 'log']));
   const [hasLog, setHasLog] = useState(false);
-  const [incremental, setIncremental] = useState(false);
-  const [lastSync, setLastSync] = useState('');
-  const [resetConfirm, setResetConfirm] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
+  // One-time migration (fold old supplemental documents). Temporary — remove with the panel below.
+  const [migPlan, setMigPlan] = useState<MigrationPlan | null>(null);
+  const [migSelected, setMigSelected] = useState<Set<string>>(new Set());
+  const [migStatus, setMigStatus] = useState('');
+  const [migConfirm, setMigConfirm] = useState(false);
+  const [migApplied, setMigApplied] = useState(false);
+  // The panel and the sync both mint `mg:<remId>` ids, so the panel keeps its OWN marks — sharing
+  // `done`/`failed` made a sync merge paint ✅/❌ on a migration row that never ran.
+  const [migDone, setMigDone] = useState<Set<string>>(new Set());
+  const [migFailed, setMigFailed] = useState<Set<string>>(new Set());
 
   const ctxRef = useRef<SyncContext | null>(null);
   const logRef = useRef<SyncLog | null>(null);
-  const runStartRef = useRef<string>('');
   const previewStartedRef = useRef(false);
+  // Cancels an in-flight fetch when the popup closes: fetchExport + the minute-long throttled Reader
+  // sweep would otherwise keep running, setting state on an unmounted widget and toasting into the void.
+  const abortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
 
-  // On open: show the current mode + last-sync, AND validate the token so a missing/invalid one is
-  // caught right here (with a friendly pointer to settings) instead of mid-fetch as an HTTP 401.
-  // Guarded by `cancelled` (unmount) + `previewStartedRef` (the user clicking "Get from Readwise"
-  // mid-check) so the async verify result never clobbers a fetch that's already underway.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  // On open: show the active tag filter AND validate the token so a missing/invalid one is caught right
+  // here (with a friendly pointer to settings) instead of mid-fetch as an HTTP 401. The tag line is set
+  // regardless; only the STATUS text is gated on `previewStartedRef` (the user clicking "Get from
+  // Readwise" mid-check) so the async verify result never clobbers a fetch that's already underway.
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const inc = !!(await plugin.settings.getSetting<boolean>(SETTINGS.incremental));
-      const last = (await plugin.storage.getSynced<string>(STORAGE.lastSyncDate)) || '';
       const tagList = parseTagFilter(await plugin.settings.getSetting<string>(SETTINGS.tagFilter));
       const token = (await plugin.settings.getSetting<string>(SETTINGS.apiKey))?.trim();
-      if (cancelled || previewStartedRef.current) return;
-      setIncremental(inc);
-      setLastSync(last);
+      if (cancelled) return;
       setTags(tagList);
+      if (previewStartedRef.current) return;
       if (!token) {
         setStatus('No Readwise token set — add one in the plugin settings (readwise.io/access_token) to sync.');
         return;
       }
       setStatus('Checking your Readwise token…');
-      const ok = await verifyToken(token);
+      const check = await verifyToken(token);
       if (cancelled || previewStartedRef.current) return;
       setStatus(
-        ok
+        check === 'ok'
           ? 'Ready. Click "Get from Readwise" to preview what will sync.'
-          : 'Readwise token looks invalid — check it in the plugin settings (readwise.io/access_token).'
+          : check === 'invalid'
+            ? 'Readwise rejected your token — check it in the plugin settings (readwise.io/access_token).'
+            : 'Couldn’t reach Readwise to check your token (offline, or Readwise is busy) — you can still try "Get from Readwise".'
       );
     })();
     return () => {
@@ -150,26 +244,33 @@ export const ReadwiseSync = () => {
   // ── Preview ────────────────────────────────────────────────────────────────
   const handlePreview = async () => {
     previewStartedRef.current = true;
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
     setBusy(true);
     setApplied(false);
     setPlan(null);
     setDone(new Set());
     setFailed(new Set());
     setProgress(null);
+    setWarning('');
     const log = new SyncLog();
     logRef.current = log;
     try {
-      const incremental = !!(await plugin.settings.getSetting<boolean>(SETTINGS.incremental));
-      const lastSync = (await plugin.storage.getSynced<string>(STORAGE.lastSyncDate)) || '';
-      const updatedAfter = incremental && lastSync ? lastSync : undefined;
       const tagList = parseTagFilter(await plugin.settings.getSetting<string>(SETTINGS.tagFilter));
       const included = await getIncludedCategories(plugin);
-      runStartRef.current = new Date().toISOString();
+      setTags(tagList);
+      if (included.size === 0) {
+        setStatus('All five "Include …" category settings are off — nothing to sync. Turn at least one on in the plugin settings.');
+        log.log('plan', 'No category included — nothing fetched.');
+        return;
+      }
 
-      setStatus(updatedAfter ? `Fetching changes since ${lastSync}…` : 'Fetching your full Readwise library…');
+      setStatus('Fetching your full Readwise library…');
       const { sources } = await fetchExport(plugin, {
-        updatedAfter,
+        signal: ac.signal,
         onProgress: (s, h, total) => {
+          if (!mountedRef.current) return;
           setProgress({ completed: s, total: Math.max(total || s, s) });
           setStatus(`Fetched ${s} sources, ${h} highlights…`);
         },
@@ -178,42 +279,95 @@ export const ReadwiseSync = () => {
 
       setProgress(null);
       setStatus('Fetching Readwise Reader locations… (≈20 requests/min)');
-      const readerByExternalId: Map<string, ReaderInfo> = await fetchReaderDocs(plugin, {
-        updatedAfter,
-        onProgress: (n) => setStatus(`Fetching Readwise Reader locations… ${n} docs (≈20 requests/min)`),
+      const reader = await fetchReaderDocs(plugin, {
+        signal: ac.signal,
+        onProgress: (n) => {
+          if (mountedRef.current) setStatus(`Fetching Readwise Reader locations… ${n} docs (≈20 requests/min)`);
+        },
         log,
       });
+      // Collected, not set one-by-one: a second setWarning would silently replace the first.
+      const warnings: string[] = [];
+      if (!reader.complete)
+        warnings.push(
+          `Reader location sweep stopped early (${reader.error ?? 'unknown error'}) after mapping ${reader.docs.size} docs — ` +
+            'unmapped sources keep their current location and link. A source created NOW gets its location and link ' +
+            'filled in by a later complete run, but NOT its Reader URL — consider refreshing before applying creates.'
+        );
 
       setStatus('Comparing against RemNote…');
-      const ctx = await buildSyncContext(plugin, { tagList, included, readerByExternalId, log });
+      const ctx = await buildSyncContext(plugin, {
+        tagList,
+        included,
+        readerByExternalId: reader.docs,
+        readerComplete: reader.complete,
+        log,
+      });
       ctxRef.current = ctx;
       const p = await computeSyncPlan(plugin, sources, ctx, log);
+      if (ac.signal.aborted) return;
       setPlan(p);
+      if (p.orphanDocNames.length)
+        warnings.push(
+          `${p.orphanDocNames.length} document(s) under Readwise/Sources carry the plugin's tag but no Readwise id ` +
+            `(${p.orphanDocNames.slice(0, 3).join(', ')}${p.orphanDocNames.length > 3 ? ', …' : ''}) — leftovers of an ` +
+            'interrupted create. Delete them by hand, or their sources will be imported a second time.'
+        );
+      if (warnings.length) setWarning(warnings.join(' '));
 
       // Default selection: everything actionable is ticked.
       const sel = new Set<string>();
       for (const e of p.toCreateSources) sel.add(e.id);
       for (const e of p.toUpdateSources) for (const c of e.changes) sel.add(`${e.id}:${c.field}`);
       for (const e of p.toAddHighlights) for (const h of e.highlights) sel.add(`${e.id}:${h.id}`);
+      for (const e of p.toAddSupplements) for (const h of e.highlights) sel.add(`${e.id}:${h.id}`);
+      for (const m of p.toMergeSupplementDocs) sel.add(m.id);
+      for (const d of p.toFoldLookupDuplicates) sel.add(d.id);
       setSelected(sel);
 
       const hlToAdd = p.toAddHighlights.reduce((n, g) => n + g.highlights.length, 0);
+      const supToAdd = p.toAddSupplements.reduce((n, g) => n + g.highlights.length, 0);
+      const actionable =
+        p.toCreateSources.length +
+        p.toUpdateSources.length +
+        hlToAdd +
+        supToAdd +
+        p.toMergeSupplementDocs.length +
+        p.toFoldLookupDuplicates.length;
+      // The empty-plan message keys off WHY it's empty: nothing fetched / nothing matched the tag filter
+      // within the included categories (naming both filters, since `matchingHighlights` only counts
+      // category-included sources) / everything already copied — not just the raw fetch count.
+      const excluded = p.excludedByCategory
+        ? ` (${p.excludedByCategory} source${p.excludedByCategory === 1 ? ' was' : 's were'} skipped by your "Include …" category settings)`
+        : '';
       setStatus(
-        p.toCreateSources.length + p.toUpdateSources.length + hlToAdd === 0
-          ? p.fetchedSources === 0
-            ? 'No sources found matching your tag filter — try clearing the filter to see everything.'
-            : 'Everything is already in sync.'
-          : `Found ${p.fetchedSources} sources (${p.matchingHighlights} matching highlights) — ` +
-              `${p.toCreateSources.length} to create, ${p.toUpdateSources.length} source update(s), ${hlToAdd} highlight(s) to add.`
+        actionable > 0
+          ? `Found ${p.fetchedSources} sources (${p.matchingHighlights} matching highlights) — ` +
+              `${p.toCreateSources.length} to create, ${p.toUpdateSources.length} source update(s), ${hlToAdd} highlight(s)` +
+              `${supToAdd ? ` and ${supToAdd} supplement(s)` : ''} to add` +
+              `${p.toMergeSupplementDocs.length ? `, ${p.toMergeSupplementDocs.length} supplement document(s) to fold in` : ''}.`
+          : p.fetchedSources === 0
+            ? 'Readwise returned no sources for this account.'
+            : p.matchingHighlights === 0
+              ? tagList.length
+                ? `No highlight in the included categories carries the tag${tagList.length > 1 ? 's' : ''} ${tagList.join(', ')}${excluded} — try another tag, clear the filter to copy everything, or check the category settings.`
+                : `Readwise returned ${p.fetchedSources} sources, but none has highlights in the included categories${excluded}.`
+              : 'Everything is already in sync.'
       );
     } catch (err) {
-      log.log('error', err instanceof Error ? err.message : String(err));
-      if (!isToastedError(err)) await plugin.app.toast(`Readwise sync failed: ${err instanceof Error ? err.message : String(err)}`);
-      setStatus(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+      if (isAbortError(err) || ac.signal.aborted) {
+        log.log('fetch', 'Cancelled (popup closed).');
+        return;
+      }
+      log.log('error', errText(err));
+      if (!isToastedError(err)) await plugin.app.toast(`Readwise sync failed: ${errText(err)}`);
+      setStatus(`Failed: ${errText(err)}`);
     } finally {
-      setHasLog(!!logRef.current);
-      setProgress(null);
-      setBusy(false);
+      if (mountedRef.current && abortRef.current === ac) {
+        setHasLog(true);
+        setProgress(null);
+        setBusy(false);
+      }
     }
   };
 
@@ -238,15 +392,32 @@ export const ReadwiseSync = () => {
           highlightIds: new Set<number>(entry.highlights.filter((h) => selected.has(`${entry.id}:${h.id}`)).map((h) => h.id)),
         }))
         .filter((x) => x.highlightIds.size > 0),
+      toAddSupplements: p.toAddSupplements
+        .map((entry) => ({
+          entry,
+          highlightIds: new Set<number>(entry.highlights.filter((h) => selected.has(`${entry.id}:${h.id}`)).map((h) => h.id)),
+        }))
+        .filter((x) => x.highlightIds.size > 0),
+      toMergeSupplementDocs: p.toMergeSupplementDocs.filter((m) => selected.has(m.id)),
+      toFoldLookupDuplicates: p.toFoldLookupDuplicates.filter((d) => selected.has(d.id)),
     };
 
-    const total = selection.toCreateSources.length + selection.toUpdateSources.length + selection.toAddHighlights.length;
+    const total =
+      selection.toCreateSources.length +
+      selection.toUpdateSources.length +
+      selection.toAddHighlights.length +
+      selection.toAddSupplements.length +
+      selection.toMergeSupplementDocs.length +
+      selection.toFoldLookupDuplicates.length;
     if (total === 0) {
       await plugin.app.toast('Nothing selected to apply.');
       return;
     }
 
     setBusy(true);
+    setSyncApplying(true);
+    setDone(new Set()); // a re-run after a thrown apply starts from a clean slate
+    setFailed(new Set());
     setProgress({ completed: 0, total });
     setStatus('Applying…');
     try {
@@ -262,94 +433,148 @@ export const ReadwiseSync = () => {
         },
         log
       );
-      // Stamp the last-sync date (run-start) on a fully-successful apply — used by incremental mode.
-      if (result.failed === 0 && runStartRef.current) {
-        await plugin.storage.setSynced(STORAGE.lastSyncDate, runStartRef.current);
-        setLastSync(runStartRef.current);
-      }
       setApplied(true);
+      // The sync's own merge phase folds and deletes the documents the panel lists, so its plan is dead.
+      setMigPlan(null);
+      setMigSelected(new Set());
+      setMigConfirm(false);
+      // `problems` is for FAILURES only — anything listed there ends with "retry them".
+      const problems: string[] = [];
+      if (result.highlightsFailed) problems.push(`${result.highlightsFailed} highlight(s) failed`);
+      if (result.failed) problems.push(`${result.failed} item(s) failed`);
       const msg =
         `Readwise sync applied — ${result.created} source(s) created, ${result.updated} updated, ` +
-        `${result.highlightsAdded} highlight(s) added` +
-        (result.failed ? `, ${result.failed} failed. Re-run to retry the failed items.` : '.');
+        `${result.highlightsAdded} highlight(s)` +
+        (result.supplementsAdded ? ` and ${result.supplementsAdded} supplement(s)` : '') +
+        ' added' +
+        (result.mergedDocs ? `, ${result.mergedDocs} supplement document(s) folded in` : '') +
+        (result.foldedLookups ? `, ${result.foldedLookups} duplicate lookup rem(s) folded` : '') +
+        (problems.length ? `; ${problems.join(', ')}. Click Refresh to re-check and retry them.` : '.');
       setStatus(msg);
       await plugin.app.toast(msg);
     } catch (err) {
-      const m = err instanceof Error ? err.message : String(err);
+      const m = errText(err);
       log.log('error', m);
       setStatus(`Apply failed: ${m}`);
       await plugin.app.toast(`Readwise sync failed: ${m}`);
+    } finally {
+      setHasLog(true);
+      setSyncApplying(false);
+      setBusy(false);
+    }
+  };
+
+  // ── One-time migration (temporary — remove with the panel at the bottom) ───────────────────────
+  const migToggle = (id: string) =>
+    setMigSelected((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const handleMigPreview = async () => {
+    setBusy(true);
+    setMigConfirm(false);
+    setMigStatus('Scanning your Readwise source documents…');
+    const log = logRef.current ?? new SyncLog();
+    logRef.current = log;
+    try {
+      const mp = await planSupplementMigration(plugin, log);
+      setMigPlan(mp);
+      setMigApplied(false); // only once a FRESH plan exists — a failed scan must not re-arm the button
+      setMigSelected(new Set(mp.moves.map((m) => m.id)));
+      setMigStatus(
+        mp.legacy === 0
+          ? `Nothing to migrate — none of the ${mp.scanned} source document(s) is a supplemental.`
+          : `${mp.moves.length} supplemental document(s) can be folded in` +
+              (mp.skipped.length ? `; ${mp.skipped.length} have no matching source and will be left alone.` : '.')
+      );
+    } catch (err) {
+      const m = errText(err);
+      log.log('error', m);
+      // Drop the old plan: its rems may already be migrated (and removed), so it must not stay actionable.
+      setMigPlan(null);
+      setMigSelected(new Set());
+      setMigStatus(`Migration preview failed: ${m}`);
+      await plugin.app.toast(`Migration preview failed: ${m}`);
     } finally {
       setHasLog(true);
       setBusy(false);
     }
   };
 
-  // Clear the stored last-sync date → the next sync fetches everything (full). Two-step confirm in the
-  // UI (`resetConfirm`) guards against an accidental click. Replaces the old "Readwise: Reset last sync"
-  // command.
-  const handleResetLastSync = async () => {
-    await plugin.storage.setSynced(STORAGE.lastSyncDate, '');
-    setLastSync('');
-    setResetConfirm(false);
-    await plugin.app.toast(
-      'Last-sync date cleared. Your next sync re-checks your whole Readwise library — already-synced ' +
-        'items stay “Already in sync”; nothing is re-imported or duplicated.'
-    );
+  const handleMigApply = async () => {
+    const mp = migPlan;
+    if (!mp) return;
+    const moves = mp.moves.filter((m) => migSelected.has(m.id));
+    if (!moves.length) {
+      await plugin.app.toast('Nothing selected to migrate.');
+      return;
+    }
+    setBusy(true);
+    setMigApplying(true);
+    setMigConfirm(false);
+    setMigDone(new Set());
+    setMigFailed(new Set());
+    setProgress({ completed: 0, total: moves.length });
+    setMigStatus('Migrating…');
+    const log = logRef.current ?? new SyncLog();
+    logRef.current = log;
+    try {
+      const r = await applySupplementMigration(
+        plugin,
+        moves,
+        {
+          onItemDone: (id, ok) => {
+            setProgress((pr) => (pr ? { completed: pr.completed + 1, total: pr.total } : pr));
+            (ok ? setMigDone : setMigFailed)((prev) => new Set(prev).add(id));
+          },
+        },
+        log
+      );
+      if (!mountedRef.current) return;
+      setMigApplied(true);
+      // The migration deleted documents the loaded sync plan may still reference, so that plan is dead.
+      setPlan(null);
+      setSelected(new Set());
+      ctxRef.current = null;
+      setStatus('Migration finished — click "Get from Readwise" for a fresh plan.');
+      const msg =
+        `Migration done — ${r.folded} document(s) folded in, ${r.bullets} bullet(s) moved` +
+        (r.failed ? `, ${r.failed} failed (see the log).` : '.');
+      setMigStatus(msg);
+      await plugin.app.toast(msg);
+    } catch (err) {
+      const m = errText(err);
+      log.log('error', m);
+      setMigStatus(`Migration failed: ${m}`);
+      await plugin.app.toast(`Migration failed: ${m}`);
+    } finally {
+      if (mountedRef.current) {
+        setProgress(null);
+        setHasLog(true);
+        setMigApplying(false);
+        setBusy(false);
+      }
+    }
   };
 
   // ── Render helpers ──────────────────────────────────────────────────────────
-  const rowStyle: CSSProperties = { display: 'flex', alignItems: 'flex-start', gap: 8, padding: '3px 0' };
-  const smallBtn: CSSProperties = {
-    padding: '2px 8px',
-    borderRadius: 5,
-    border: '1px solid #d1d5db',
-    background: 'transparent',
-    color: 'inherit',
-    fontSize: 12,
-    cursor: 'pointer',
-  };
-  const sectionStyle: CSSProperties = { border: '1px solid #e5e7eb', borderRadius: 8, marginBottom: 10 };
-  const headerStyle: CSSProperties = {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '8px 12px',
-    cursor: 'pointer',
-    fontWeight: 600,
-  };
-  const bodyStyle: CSSProperties = { padding: '4px 12px 10px 12px' };
   const mark = (id: string) => (done.has(id) ? ' ✅' : failed.has(id) ? ' ❌' : '');
 
-  const Section = (props: {
-    keyName: string;
-    title: string;
-    count: number;
-    leafIds: string[];
-    selectable?: boolean;
-    children: ReactNode;
-  }) => {
-    const isOpen = !collapsed.has(props.keyName);
-    const selectableLeaves = props.leafIds;
-    const allOn = selectableLeaves.length > 0 && selectableLeaves.every((id) => selected.has(id));
-    const someOn = selectableLeaves.some((id) => selected.has(id));
-    if (props.count === 0) return null;
-    return (
-      <div style={sectionStyle}>
-        <div style={headerStyle} onClick={() => toggleCollapse(props.keyName)}>
-          <span style={{ width: 14 }}>{isOpen ? '▾' : '▸'}</span>
-          {props.selectable !== false && (
-            <span onClick={(e) => e.stopPropagation()}>
-              <Check checked={allOn} indeterminate={someOn} disabled={busy || applied} onChange={() => setMany(selectableLeaves, !allOn)} />
-            </span>
-          )}
-          <span>
-            {props.title} ({props.count})
-          </span>
-        </div>
-        {isOpen && <div style={bodyStyle}>{props.children}</div>}
-      </div>
-    );
+  /** Open/close + select-all props for a selectable `Section`, derived from the current state. */
+  const sectionProps = (key: string, leafIds: string[]) => {
+    const allOn = leafIds.length > 0 && leafIds.every((id) => selected.has(id));
+    return {
+      isOpen: !collapsed.has(key),
+      onToggle: () => toggleCollapse(key),
+      select: {
+        allOn,
+        someOn: leafIds.some((id) => selected.has(id)),
+        disabled: busy || applied,
+        onToggleAll: () => setMany(leafIds, !allOn),
+      },
+    };
   };
 
   const createLeafIds = plan ? plan.toCreateSources.map((e) => e.id) : [];
@@ -368,14 +593,18 @@ export const ReadwiseSync = () => {
   }
   const updateLeafIds = plan ? plan.toUpdateSources.flatMap((e) => e.changes.map((c) => `${e.id}:${c.field}`)) : [];
   const addLeafIds = plan ? plan.toAddHighlights.flatMap((e) => e.highlights.map((h) => `${e.id}:${h.id}`)) : [];
+  const supLeafIds = plan ? plan.toAddSupplements.flatMap((e) => e.highlights.map((h) => `${e.id}:${h.id}`)) : [];
+  const mergeLeafIds = plan ? plan.toMergeSupplementDocs.map((m) => m.id) : [];
+  const dupLeafIds = plan ? plan.toFoldLookupDuplicates.map((d) => d.id) : [];
 
   const pct = progress && progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
-  // While an apply is in flight, hide the (potentially 1000+ row) results list. Re-rendering that whole
-  // tree on every applied item — on top of the apply's own thousands of SDK calls — can exhaust the
-  // plugin-widget iframe's renderer memory, and the browser kills the frame (the grey "sad tab" crash on
-  // big syncs). During apply we render only a compact progress panel; the full list returns with ✅/❌
-  // once `applied` flips true. (Preview keeps `plan` null, so this is false then.)
-  const applying = !!plan && busy && !applied;
+  // While an apply is in flight, hide the (potentially 1000+ row) results list AND the Log box.
+  // Re-rendering that whole tree on every applied item — on top of the apply's own thousands of SDK
+  // calls — can exhaust the plugin-widget iframe's renderer memory, and the browser kills the frame (the
+  // grey "sad tab" crash on big syncs). During apply we render only a compact progress panel; the full
+  // list returns with ✅/❌ once `applied` flips true. Keyed on the sync apply ALONE: the migration
+  // below also sets `busy`, and it must not be mistaken for (or hidden by) a sync apply.
+  const applying = syncApplying;
 
   return (
     <div
@@ -416,8 +645,19 @@ export const ReadwiseSync = () => {
         </button>
         <button
           onClick={() => plugin.widget.closePopup()}
-          title="Close"
-          style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #d1d5db', cursor: 'pointer' }}
+          disabled={syncApplying || migApplying}
+          title={
+            syncApplying || migApplying
+              ? 'Wait — closing now would leave the knowledge base half-written'
+              : 'Close'
+          }
+          style={{
+            padding: '4px 10px',
+            borderRadius: 6,
+            border: '1px solid #d1d5db',
+            cursor: syncApplying || migApplying ? 'default' : 'pointer',
+            opacity: syncApplying || migApplying ? 0.5 : 1,
+          }}
         >
           ✕
         </button>
@@ -437,39 +677,7 @@ export const ReadwiseSync = () => {
           </div>
         )}
 
-        {/* Mode + last-sync, with a confirm-gated Reset last sync button (replaces the old command). */}
-        <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#6b7280' }}>
-          <span>
-            {incremental ? 'Quick' : 'Full'} sync{lastSync ? ` · last synced ${lastSync}` : ' · no stored last-sync date'}
-          </span>
-          <div style={{ flex: 1 }} />
-          {!resetConfirm ? (
-            <button
-              onClick={() => setResetConfirm(true)}
-              disabled={busy || !lastSync}
-              title={lastSync ? 'Clear the stored last-sync date so the next sync re-checks your whole Readwise library (already-synced items aren’t re-imported)' : 'No stored last-sync date to reset'}
-              style={{ ...smallBtn, opacity: busy || !lastSync ? 0.5 : 1, cursor: busy || !lastSync ? 'default' : 'pointer' }}
-            >
-              Reset last sync
-            </button>
-          ) : (
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span style={{ color: '#b45309' }}>
-                Next sync re-checks your whole library (already-synced items aren’t re-imported). Reset?
-              </span>
-              <button
-                onClick={handleResetLastSync}
-                disabled={busy}
-                style={{ ...smallBtn, borderColor: '#dc2626', color: '#dc2626' }}
-              >
-                Reset
-              </button>
-              <button onClick={() => setResetConfirm(false)} disabled={busy} style={smallBtn}>
-                Cancel
-              </button>
-            </span>
-          )}
-        </div>
+        {warning && <div style={{ marginTop: 6, fontSize: 12, color: '#b45309' }}>⚠ {warning}</div>}
 
         {/* Tag filter: which tags are being matched, or that everything will be copied. */}
         <div style={{ marginTop: 6, fontSize: 12, color: '#6b7280' }}>
@@ -503,17 +711,16 @@ export const ReadwiseSync = () => {
         )}
         {plan && !applying && (
           <>
-            <Section keyName="create" title="Will create (sources)" count={plan.toCreateSources.length} leafIds={createLeafIds}>
+            <Section title="Will create (sources)" count={plan.toCreateSources.length} {...sectionProps('create', createLeafIds)}>
               {createGroups.map(([cat, entries]) => (
                 // Indent each category group under "Will create"; rows (paddingLeft 44) sit a full step
                 // DEEPER than the category header (its checkbox is ~22px in), so they read as nested
                 // under the category, not level with it.
                 <div key={cat} style={{ marginLeft: 16 }}>
                   <Section
-                    keyName={`create:${cat}`}
                     title={cat}
                     count={entries.length}
-                    leafIds={entries.map((e) => e.id)}
+                    {...sectionProps(`create:${cat}`, entries.map((e) => e.id))}
                   >
                     {entries.map((e) => (
                       <div key={e.id} style={{ ...rowStyle, paddingLeft: 44 }}>
@@ -522,6 +729,10 @@ export const ReadwiseSync = () => {
                           {e.name}
                           <span style={{ color: '#6b7280' }}>
                             {' '}· {e.eligible.length} highlight{e.eligible.length === 1 ? '' : 's'}
+                            {e.supplements.length
+                              ? ` · ${e.supplements.length} supplement${e.supplements.length === 1 ? '' : 's'}`
+                              : ''}
+                            {e.isSupplementDoc ? ' · no source document yet — held here until one appears' : ''}
                           </span>
                           {mark(e.id)}
                         </span>
@@ -532,7 +743,7 @@ export const ReadwiseSync = () => {
               ))}
             </Section>
 
-            <Section keyName="update" title="Will update source" count={plan.toUpdateSources.length} leafIds={updateLeafIds}>
+            <Section title="Will update source" count={plan.toUpdateSources.length} {...sectionProps('update', updateLeafIds)}>
               {plan.toUpdateSources.map((e) => (
                 <div key={e.id} style={{ marginBottom: 6 }}>
                   <div style={{ fontWeight: 600 }}>
@@ -551,7 +762,7 @@ export const ReadwiseSync = () => {
               ))}
             </Section>
 
-            <Section keyName="add" title="Will add highlights" count={plan.toAddHighlights.length} leafIds={addLeafIds}>
+            <Section title="Will add highlights" count={plan.toAddHighlights.length} {...sectionProps('add', addLeafIds)}>
               {plan.toAddHighlights.map((e) => (
                 <div key={e.id} style={{ marginBottom: 6 }}>
                   <div style={{ fontWeight: 600 }}>
@@ -568,7 +779,78 @@ export const ReadwiseSync = () => {
               ))}
             </Section>
 
-            <Section keyName="already" title="Already in sync" count={plan.alreadyInSync.length} leafIds={[]} selectable={false}>
+            <Section title="Will add supplements" count={plan.toAddSupplements.length} {...sectionProps('sup', supLeafIds)}>
+              {plan.toAddSupplements.map((e) => (
+                <div key={e.id} style={{ marginBottom: 6 }}>
+                  <div style={{ fontWeight: 600 }}>
+                    {e.name} <span style={{ color: '#6b7280' }}>(+{e.highlights.length} under “Supplements”)</span>
+                    {mark(e.id)}
+                  </div>
+                  {e.highlights.map((h) => (
+                    <div key={`${e.id}:${h.id}`} style={{ ...rowStyle, paddingLeft: 16 }}>
+                      <Check checked={selected.has(`${e.id}:${h.id}`)} disabled={busy || applied} onChange={() => toggle(`${e.id}:${h.id}`)} />
+                      <span>{clip(h.text)}</span>
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </Section>
+
+            <Section
+              title="Will merge supplement documents into their source"
+              count={plan.toMergeSupplementDocs.length}
+              {...sectionProps('merge', mergeLeafIds)}
+            >
+              {plan.toMergeSupplementDocs.map((m) => (
+                <div key={m.id} style={{ ...rowStyle, paddingLeft: 16 }}>
+                  <Check checked={selected.has(m.id)} disabled={busy || applied} onChange={() => toggle(m.id)} />
+                  <span>
+                    {m.supplementName} <span style={{ color: '#6b7280' }}>→ {m.targetName}</span>
+                    <span style={{ color: '#6b7280' }}>
+                      {' '}· its bullets move under “Supplements”
+                      {m.bulletCount === undefined
+                        ? m.ledgerCount
+                          ? ` (${m.ledgerCount} highlight${m.ledgerCount === 1 ? '' : 's'} recorded)`
+                          : ''
+                        : ` (${m.bulletCount} bullet${m.bulletCount === 1 ? '' : 's'})`}
+                      , then the document is deleted once empty
+                    </span>
+                    {mark(m.id)}
+                  </span>
+                </div>
+              ))}
+            </Section>
+
+            <Section
+              title="Will fold duplicate Author / Category / Location rems"
+              count={plan.toFoldLookupDuplicates.length}
+              {...sectionProps('dup', dupLeafIds)}
+            >
+              {plan.toFoldLookupDuplicates.map((d) => (
+                <div key={d.id} style={{ ...rowStyle, paddingLeft: 16 }}>
+                  <Check checked={selected.has(d.id)} disabled={busy || applied} onChange={() => toggle(d.id)} />
+                  <span>
+                    <b>{d.name}</b> <span style={{ color: '#6b7280' }}>in {d.docName}</span>
+                    <span style={{ color: '#6b7280' }}>
+                      {' '}· a duplicate copy is merged into the oldest one
+                      {d.childCount ? `, moving ${d.childCount} child rem${d.childCount === 1 ? '' : 's'}` : ''}
+                      {d.referenceCount
+                        ? ` and re-pointing ${d.referenceCount} reference${d.referenceCount === 1 ? '' : 's'}`
+                        : ''}
+                      , then the duplicate is deleted
+                    </span>
+                    {mark(d.id)}
+                  </span>
+                </div>
+              ))}
+            </Section>
+
+            <Section
+              title="Already in sync"
+              count={plan.alreadyInSync.length}
+              isOpen={!collapsed.has('already')}
+              onToggle={() => toggleCollapse('already')}
+            >
               {plan.alreadyInSync.map((e) => (
                 <div key={e.id} style={{ ...rowStyle, color: '#6b7280' }}>
                   <span style={{ width: 22 }} />
@@ -579,7 +861,92 @@ export const ReadwiseSync = () => {
           </>
         )}
 
-        {hasLog && (
+        {/* ── One-time migration panel. TEMPORARY: delete this block (and the handlers + the migration
+            functions in sync.ts) once every knowledge base has been migrated. ── */}
+        {!applying && (
+          <div style={{ ...sectionStyle, borderColor: '#fcd34d' }}>
+            <div style={headerStyle} onClick={() => toggleCollapse('migrate')}>
+              <span style={{ width: 14 }}>{collapsed.has('migrate') ? '▸' : '▾'}</span>
+              <span>Fallback — fold leftover “Supplemental” documents in</span>
+            </div>
+            {!collapsed.has('migrate') && (
+              <div style={bodyStyle}>
+                <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 8, lineHeight: 1.5 }}>
+                  <b>You usually don’t need this.</b> The normal sync stages a <b>Will merge supplement documents</b> row
+                  on its own for every supplement document it can match — including ones whose Readwise source has since
+                  been deleted, which it recognises by their Category property and their name. Titles arrive as ordinary{' '}
+                  <b>name</b> rows. This panel is a fallback for when you want to fold documents in <b>without fetching
+                  from Readwise at all</b> (offline, or a bad token). It does the same thing: moves their bullets under the{' '}
+                  <b>Supplements</b> heading of the matching source document, merges the sync records, then deletes the
+                  emptied document. Highlights are <b>moved, not copied</b>, so edits, tags and flashcards are kept.
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <button onClick={handleMigPreview} disabled={busy} style={{ ...smallBtn, padding: '4px 10px' }}>
+                    {migPlan ? 'Re-scan' : 'Preview migration'}
+                  </button>
+                  {migPlan && migPlan.moves.length > 0 && !migApplied && (
+                    !migConfirm ? (
+                      <button
+                        onClick={() => setMigConfirm(true)}
+                        disabled={busy || migSelected.size === 0}
+                        style={{ ...smallBtn, padding: '4px 10px', borderColor: '#b45309', color: '#b45309' }}
+                      >
+                        Migrate {migSelected.size} document{migSelected.size === 1 ? '' : 's'}
+                      </button>
+                    ) : (
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{ color: '#b45309', fontSize: 12 }}>
+                          Move the bullets of {migSelected.size} document{migSelected.size === 1 ? '' : 's'} and delete the
+                          emptied document{migSelected.size === 1 ? '' : 's'}?
+                        </span>
+                        <button
+                          onClick={handleMigApply}
+                          disabled={busy}
+                          style={{ ...smallBtn, borderColor: '#dc2626', color: '#dc2626' }}
+                        >
+                          Migrate
+                        </button>
+                        <button onClick={() => setMigConfirm(false)} disabled={busy} style={smallBtn}>
+                          Cancel
+                        </button>
+                      </span>
+                    )
+                  )}
+                  {migStatus && <span style={{ fontSize: 12, color: '#374151' }}>{migStatus}</span>}
+                </div>
+
+                {migPlan?.moves.map((m) => (
+                  <div key={m.id} style={{ ...rowStyle, paddingLeft: 4 }}>
+                    <Check
+                      checked={migSelected.has(m.id)}
+                      disabled={busy || migApplied}
+                      onChange={() => migToggle(m.id)}
+                    />
+                    <span>
+                      {m.supplementName} <span style={{ color: '#6b7280' }}>→ {m.targetName}</span>
+                      <span style={{ color: '#6b7280' }}>
+                        {' '}· {m.bulletCount} bullet{m.bulletCount === 1 ? '' : 's'}
+                      </span>
+                      {migDone.has(m.id) ? ' ✅' : migFailed.has(m.id) ? ' ❌' : ''}
+                    </span>
+                  </div>
+                ))}
+                {migPlan?.skipped.map((k) => (
+                  <div key={k.id} style={{ ...rowStyle, paddingLeft: 4, color: '#6b7280' }}>
+                    <span style={{ width: 22 }} />
+                    <span>
+                      {k.name} · left alone ({k.reason})
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* The Log box is also hidden while applying: its text is re-joined from every line on each
+            render, which would otherwise happen once per applied item. */}
+        {hasLog && !applying && (
           <div style={sectionStyle}>
             <div style={headerStyle} onClick={() => toggleCollapse('log')}>
               <span style={{ width: 14 }}>{collapsed.has('log') ? '▸' : '▾'}</span>

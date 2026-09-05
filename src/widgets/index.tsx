@@ -16,6 +16,10 @@ import {
   SOURCE_SLOTS,
   SYNC_WIDGET,
 } from '../lib/consts';
+// Namespace imports used ONLY by the dev-server-gated test hook at the end of onActivate.
+import * as consts from '../lib/consts';
+import * as api from '../lib/readwiseApi';
+import * as sync from '../lib/sync';
 
 async function onActivate(plugin: ReactRNPlugin) {
   // ── Settings ──────────────────────────────────────────────────────────────
@@ -42,30 +46,20 @@ async function onActivate(plugin: ReactRNPlugin) {
     title: 'Apply highlight colors',
     description:
       "When ON, each highlight's Readwise color (yellow/blue/pink/orange/green/purple) is applied as a " +
-      'RemNote highlight color. When OFF, highlights are imported as plain text.',
-    defaultValue: true,
+      'RemNote highlight color. When OFF (the default), highlights are imported as plain text.',
+    defaultValue: false,
   });
 
   for (const c of CATEGORIES) {
     await plugin.settings.registerBooleanSetting({
       id: categorySettingId(c),
       title: `Include ${CATEGORY_LABEL[c]}`,
-      description: `Include Readwise ${CATEGORY_LABEL[c].toLowerCase()} when syncing.`,
+      description:
+        `Include Readwise ${CATEGORY_LABEL[c].toLowerCase()} when syncing. ` +
+        '(Turn all five category toggles off and nothing syncs.)',
       defaultValue: true,
     });
   }
-
-  await plugin.settings.registerBooleanSetting({
-    id: SETTINGS.incremental,
-    title: 'Quick sync (only fetch changes since last sync)',
-    description:
-      'When ON, each sync only fetches Readwise sources changed since the last successful sync — fast, ' +
-      'and new tags/edits are caught (tagging bumps the highlight’s updated date). When OFF, every sync ' +
-      'fetches your whole library. Keep it OFF while first working through your library (quick sync ' +
-      'can’t resurface older items you haven’t synced yet); turn it ON once you’re caught up. ' +
-      'Use the Reset last sync button in the Sync Readwise popup anytime to force a full fetch.',
-    defaultValue: false,
-  });
 
   await plugin.settings.registerBooleanSetting({
     id: SETTINGS.initIncremental,
@@ -104,6 +98,7 @@ async function onActivate(plugin: ReactRNPlugin) {
         { code: SOURCE_SLOTS.tags, name: 'Tags',
           propertyType: PropertyType.MULTI_SELECT, propertyLocation: PropertyLocation.ONLY_DOCUMENT },
         // Hidden identity / bookkeeping.
+        { code: SOURCE_SLOTS.linkUrl, name: 'Link URL', onlyProgrammaticModifying: true, hidden: true },
         { code: SOURCE_SLOTS.userBookId, name: 'Readwise Book ID', onlyProgrammaticModifying: true, hidden: true },
         { code: SOURCE_SLOTS.baseTitle, name: 'Base Title', onlyProgrammaticModifying: true, hidden: true },
         { code: SOURCE_SLOTS.externalId, name: 'Reader Doc ID', onlyProgrammaticModifying: true, hidden: true },
@@ -118,7 +113,7 @@ async function onActivate(plugin: ReactRNPlugin) {
     dimensions: { height: 800, width: 1000 },
   });
 
-  // The ONLY command now (reset-last-sync moved into the popup as a confirm-gated button). Omnibar
+  // The ONLY command. Omnibar
   // position is NOT controllable from the SDK (Command has no priority/order field) and is NOT
   // alphabetical — RemNote ranks commands by recency/frequency of use. quickCode 'rw' opens it directly.
   await plugin.app.registerCommand({
@@ -129,6 +124,23 @@ async function onActivate(plugin: ReactRNPlugin) {
       await plugin.widget.openPopup(SYNC_WIDGET);
     },
   });
+
+  // ── Automated-test hook — DEV ONLY ────────────────────────────────────────
+  // Exposes the plugin handle and the engine on this widget's window so the test harness
+  // (scripts/suite.js + scripts/popup-ui.js, driven over the Chrome DevTools Protocol by scripts/cdp.js) can run the REAL
+  // engine against the REAL knowledge base using SYNTHETIC Readwise data — the only way to cover
+  // edge cases the live API will never hand us on demand. Gated on the bundle being served from the
+  // local dev server, so a packaged build never activates it. NOTE: the engine is imported
+  // STATICALLY above (a dynamic import broke the widget bundle), so the code IS present in the
+  // packaged index.js — inert, but present. It only calls the same public functions the popup calls,
+  // so it cannot change how the plugin behaves.
+  try {
+    if (typeof location !== 'undefined' && location.hostname === 'localhost') {
+      (globalThis as unknown as Record<string, unknown>).__remwise = { plugin, sync, api, consts };
+    }
+  } catch {
+    /* a test hook must never break activation */
+  }
 }
 
 async function onDeactivate(_: ReactRNPlugin) {}

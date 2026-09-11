@@ -507,11 +507,15 @@ export type SlotHealth = 'ok' | 'dangling' | 'empty' | 'short' | 'unknown';
  *    resolves to '' and `link` is compared against the intact raw `linkUrl` copy. Verified live on
  *    2026-09-11: 334 documents holding 567 dangling references all reported "already in sync".
  *  - `empty`   — the slot holds nothing although Readwise has a value for it (a wiped property).
+ *  Exported ONLY so the suite can drive every verdict directly (K10): the `unknown` branch needs a slot
+ *  whose READ throws, and a rem's `getPowerupPropertyAsRichText` is an OWN property on each instance, so
+ *  it cannot be stubbed via the prototype. Nothing outside this module calls it in production.
+ *
  *  - `short`   — it holds FEWER references than it should (e.g. the `Readwise` slot lost one of its two
  *    links). Only reported when `wantCount` is passed, and only above zero refs, so a plain-text
  *    fallback is never mistaken for a truncated one.
  */
-async function slotHealth(
+export async function slotHealth(
   plugin: RNPlugin,
   cache: RefNameCache,
   rem: PluginRem,

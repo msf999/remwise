@@ -493,22 +493,63 @@ async function foldLookupDuplicate(plugin: RNPlugin, dup: LookupDuplicate, log?:
   log?.log('apply', `  folded duplicate "${dup.name}" under ${dup.docName} into the oldest copy.`);
 }
 
-/** The subset of `slots` holding a reference that no longer resolves to a named rem (a "dangling" ref). */
-async function danglingSlots(plugin: RNPlugin, cache: RefNameCache, rem: PluginRem, slots: string[]): Promise<string[]> {
-  const out: string[] = [];
-  for (const slot of slots) {
-    const rt = await getSlotRichText(rem, slot);
-    if (!rt) continue;
-    for (const el of rt) {
-      if (typeof el === 'string') continue;
-      const obj = el as { i?: string; _id?: string };
-      if (obj.i === 'q' && obj._id && (await resolveRefName(plugin, cache, obj._id)) === '') {
-        out.push(slot);
-        break;
+/** Why a slot needs rewriting even though its VALUE compares equal (or isn't compared at all). */
+export type SlotHealth = 'ok' | 'dangling' | 'empty' | 'short' | 'unknown';
+
+/**
+ * STRUCTURAL health of one plugin-owned slot. Deliberately never compares the rendered VALUE: a link
+ * rem renders as the page title RemNote fetched, and an image element never round-trips, so a value
+ * comparison on `link`/`readwiseUrl`/`cover` stages a row that can never be satisfied. This looks only
+ * at whether the slot still holds what it is supposed to hold:
+ *
+ *  - `dangling` — it references a rem that no longer resolves. RemNote renders that as **"Loading"**
+ *    and offers "Restore This Bullet"; the value diffs CANNOT see it, because a dangling reference
+ *    resolves to '' and `link` is compared against the intact raw `linkUrl` copy. Verified live on
+ *    2026-09-11: 334 documents holding 567 dangling references all reported "already in sync".
+ *  - `empty`   — the slot holds nothing although Readwise has a value for it (a wiped property).
+ *  - `short`   — it holds FEWER references than it should (e.g. the `Readwise` slot lost one of its two
+ *    links). Only reported when `wantCount` is passed, and only above zero refs, so a plain-text
+ *    fallback is never mistaken for a truncated one.
+ */
+async function slotHealth(
+  plugin: RNPlugin,
+  cache: RefNameCache,
+  rem: PluginRem,
+  slot: string,
+  opts: { wantNonEmpty?: boolean; wantCount?: number; els?: RichTextInterface } = {}
+): Promise<SlotHealth> {
+  let els = opts.els;
+  if (els === undefined) {
+    // STRICT read, one retry. `getSlotRichText` swallows a failure and returns undefined, which is
+    // indistinguishable from a genuinely unset slot — and concluding 'empty' from a FAILED read would
+    // rewrite a perfectly healthy slot (for `readwise` that can even drop a url). Same swallowed-read
+    // class the 2026-09-04 audit hardened the identity reads against; here it degrades to 'unknown',
+    // which stages nothing.
+    for (let attempt = 0; els === undefined && attempt < 2; attempt += 1) {
+      try {
+        els = (await rem.getPowerupPropertyAsRichText(SOURCE_POWERUP, slot)) ?? [];
+      } catch {
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
       }
     }
+    if (els === undefined) return 'unknown';
   }
-  return out;
+  let refs = 0;
+  for (const el of els) {
+    if (typeof el === 'string') continue;
+    const obj = el as { i?: string; _id?: string };
+    if (obj.i !== 'q' || !obj._id) continue;
+    refs += 1;
+    if ((await resolveRefName(plugin, cache, obj._id)) !== '') continue;
+    // An empty NAME means the target is GONE — or that it exists carrying blank text. Only the first is
+    // repairable: `createLinkRem` returns the EXISTING rem for a known url, so rewriting a link slot
+    // whose rem is merely unnamed hands back the very same rem and the row would restage for ever.
+    if ((await plugin.rem.findOne(obj._id)) === undefined) return 'dangling';
+  }
+  const hasContent = els.some((el) => (typeof el === 'string' ? el.trim() !== '' : true));
+  if (opts.wantNonEmpty && !hasContent) return 'empty';
+  if (opts.wantCount !== undefined && refs > 0 && refs < opts.wantCount) return 'short';
+  return 'ok';
 }
 
 // ───────────────────────── Ledger ─────────────────────────
@@ -850,7 +891,11 @@ async function writeReadwiseUrls(plugin: RNPlugin, rem: PluginRem, urls: string[
     const lr = await plugin.rem.createLinkRem(u, false);
     if (lr) ids.push(lr._id);
   }
-  if (ids.length === 0) return void (await setProp(rem, SOURCE_SLOTS.readwiseUrl, [urls.join('\n')]));
+  // Fall back to plain text when ANY url failed to get a link rem, not just when they all did: writing
+  // only the ones that worked leaves the slot looking TRUNCATED to the repair pass ('short'), which
+  // would restage a row the writer cannot satisfy. `slotHealth`'s `refs > 0` clause then reads this
+  // plain-text form as healthy.
+  if (ids.length < urls.length) return void (await setProp(rem, SOURCE_SLOTS.readwiseUrl, [urls.join('\n')]));
   let b = plugin.richText.rem(ids[0]);
   for (let i = 1; i < ids.length; i++) b = b.text('\n').rem(ids[i]);
   await setProp(rem, SOURCE_SLOTS.readwiseUrl, await b.value());
@@ -862,7 +907,11 @@ async function writeCover(plugin: RNPlugin, rem: PluginRem, url: string): Promis
   try {
     await setProp(rem, SOURCE_SLOTS.cover, await plugin.richText.image(u).value());
   } catch {
-    /* a bad cover URL must never fail the source write */
+    // A url RemNote's image element rejects must never fail the source write — but it must not leave
+    // the slot EMPTY either: the structural repair pass reads an empty slot as corrupt and would
+    // restage the identical row on every single sync. Storing the raw url as text keeps the state
+    // stable (and still tells the user what the cover was meant to be).
+    await setProp(rem, SOURCE_SLOTS.cover, [u]).catch(() => undefined);
   }
 }
 
@@ -1061,14 +1110,17 @@ async function diffSource(
   if (nameKey(curAuthor) !== nameKey(wantAuthor))
     changes.push({ field: 'author', fromDisplay: displayValue(curAuthor), toDisplay: displayValue(wantAuthor) });
 
-  const curCat = await slotToComparable(plugin, ctx.refNameCache, await getSlotRichText(es.rem, SOURCE_SLOTS.category));
+  const catRt = await getSlotRichText(es.rem, SOURCE_SLOTS.category);
+  const curCat = await slotToComparable(plugin, ctx.refNameCache, catRt);
   const wantCat = categoryLabelOf(source);
   if (nameKey(curCat) !== nameKey(wantCat))
     changes.push({ field: 'category', fromDisplay: displayValue(curCat), toDisplay: displayValue(wantCat) });
 
   const loc = desiredLocation(source, ctx);
+  let locRt: RichTextInterface | undefined;
   if (loc.known) {
-    const curLoc = await slotToComparable(plugin, ctx.refNameCache, await getSlotRichText(es.rem, SOURCE_SLOTS.location));
+    locRt = await getSlotRichText(es.rem, SOURCE_SLOTS.location);
+    const curLoc = await slotToComparable(plugin, ctx.refNameCache, locRt);
     if (nameKey(curLoc) !== nameKey(loc.label))
       changes.push({ field: 'location', fromDisplay: displayValue(curLoc), toDisplay: displayValue(loc.label) });
   }
@@ -1080,27 +1132,67 @@ async function diffSource(
   // Fall back to the resolved name only for documents written before that slot existed — one applied
   // row then populates it and the comparison is exact from then on.
   const linkKnown = !!(source.source_url ?? '').trim() || loc.known;
+  const wantLink = linkKnown ? linkOf(source, ctx) : '';
+  let linkRt: RichTextInterface | undefined;
   if (linkKnown) {
-    const wantLink = linkOf(source, ctx);
     const storedUrl = await getProp(es.rem, SOURCE_SLOTS.linkUrl);
-    const curLink = storedUrl || (await slotToComparable(plugin, ctx.refNameCache, await getSlotRichText(es.rem, SOURCE_SLOTS.link)));
+    linkRt = await getSlotRichText(es.rem, SOURCE_SLOTS.link);
+    const curLink = storedUrl || (await slotToComparable(plugin, ctx.refNameCache, linkRt));
     if (linkKey(curLink) !== linkKey(wantLink))
       changes.push({ field: 'link', fromDisplay: displayValue(curLink), toDisplay: displayValue(wantLink) });
   }
 
-  // Self-heal a dangling Author/Category/Location reference (its lookup rem was deleted) even when the
-  // values "match" (a dangling ref resolves to '', which equals an empty desired value). Each dangling
-  // slot stages ITS OWN field so applyUpdate rewrites the right slot; Location only when it's known.
+  // ── Self-heal a CORRUPTED slot ───────────────────────────────────────────────────────────────────
+  // A slot can be broken while its value still compares EQUAL, so none of the diffs above can see it:
+  // a deleted lookup/link rem leaves a dangling reference that resolves to '' (RemNote renders it as
+  // "Loading"), and `link` is compared against the intact raw `linkUrl` copy rather than the reference.
+  // Without this pass such a document reports "already in sync" for ever and no re-sync can repair it
+  // — verified live on 2026-09-11, where 334 documents holding 567 dangling references staged 0 rows.
+  // Every check is STRUCTURAL (see `slotHealth`), never a value comparison, which is what lets
+  // `readwise` and `cover` be repaired here without reintroducing the phantom diffs that kept them
+  // create-only. Each broken slot stages ITS OWN field, so applyUpdate rewrites exactly that slot, and
+  // the row is opt-out like any other.
   const staged = new Set(changes.map((c) => c.field));
-  const dangling = await danglingSlots(plugin, ctx.refNameCache, es.rem, [SOURCE_SLOTS.author, SOURCE_SLOTS.category, SOURCE_SLOTS.location]);
-  for (const slot of dangling) {
-    if (slot === SOURCE_SLOTS.author && !staged.has('author'))
-      changes.push({ field: 'author', fromDisplay: '(dangling ref)', toDisplay: displayValue(wantAuthor) });
-    else if (slot === SOURCE_SLOTS.category && !staged.has('category'))
-      changes.push({ field: 'category', fromDisplay: '(dangling ref)', toDisplay: displayValue(wantCat) });
-    else if (slot === SOURCE_SLOTS.location && loc.known && !staged.has('location'))
-      changes.push({ field: 'location', fromDisplay: '(dangling ref)', toDisplay: displayValue(loc.label) });
+  const cache = ctx.refNameCache;
+  const heal = (field: UpdatableField, health: SlotHealth, to: string): void => {
+    // 'unknown' = the slot could not be READ. Staging a rewrite off a failed read is how you destroy a
+    // healthy slot, so it is treated as "no opinion" and nothing is staged.
+    if (health === 'ok' || health === 'unknown' || staged.has(field)) return;
+    staged.add(field);
+    const from = health === 'dangling' ? '(dangling ref)' : health === 'short' ? '(incomplete)' : '(missing)';
+    changes.push({ field, fromDisplay: from, toDisplay: to });
+  };
+
+  // Author: the scan already walked this slot's references, so reuse its verdict rather than re-read.
+  // An empty author slot needs no heal — the value diff above stages it whenever Readwise has an
+  // author, and when it doesn't there is nothing to write.
+  if (es.authorDangling) heal('author', 'dangling', displayValue(wantAuthor));
+  heal('category', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.category, { wantNonEmpty: !!wantCat, els: catRt }), displayValue(wantCat));
+  if (loc.known)
+    heal('location', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.location, { wantNonEmpty: !!loc.label, els: locRt }), displayValue(loc.label));
+  if (linkKnown)
+    heal('link', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.link, { wantNonEmpty: !!wantLink, els: linkRt }), displayValue(wantLink));
+
+  // `readwise` + `cover` are reachable ONLY through this repair pass — they are never value-diffed.
+  // The readwise repair REPLACES the whole slot, so it may run only when this run actually knows the
+  // full url set: with an INCOMPLETE Reader sweep and no Reader entry for a Reader source,
+  // `readwiseUrlsOf` is missing the Reader url, and "repairing" would silently drop a healthy link.
+  // Same reason the link and location diffs are gated on being KNOWN this run.
+  const readwiseKnown = !(source.external_id ?? '').trim() || ctx.readerComplete || !!readerInfoOf(source, ctx);
+  if (readwiseKnown) {
+    const wantUrls = readwiseUrlsOf(source, ctx);
+    heal(
+      'readwise',
+      await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.readwiseUrl, {
+        wantNonEmpty: wantUrls.length > 0,
+        wantCount: wantUrls.length,
+      }),
+      displayValue(wantUrls.join(', '))
+    );
   }
+  const wantCover = (source.cover_image_url ?? '').trim();
+  heal('cover', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.cover, { wantNonEmpty: !!wantCover }), displayValue(wantCover));
+
   return changes;
 }
 
@@ -1438,6 +1530,7 @@ export async function computeSyncPlan(
       toAddHighlights.push({ id: `ha:${es.rem._id}`, sourceRemId: es.rem._id, name: es.name, rem: es.rem, highlights: newHls });
     if (!changes.length && !newHls.length && !supplementsByRemId.has(es.rem._id))
       alreadyInSync.push({ id: `k:${es.rem._id}`, name: es.name });
+    await yieldToHost(); // the repair pass added slot reads per source; keep the iframe breathing
   }
 
   // A supplement document still waiting for its main source gains its new highlights as ordinary
@@ -1541,6 +1634,14 @@ async function applyUpdate(
         break;
       case 'link':
         if (source) await writeLink(plugin, rem, linkOf(source, ctx));
+        break;
+      // Reached only by the repair pass in diffSource (never value-diffed): rewrite the slot from
+      // scratch, which mints fresh link rems for the urls and re-points the property at them.
+      case 'readwise':
+        if (source) await writeReadwiseUrls(plugin, rem, readwiseUrlsOf(source, ctx));
+        break;
+      case 'cover':
+        if (source) await writeCover(plugin, rem, (source.cover_image_url ?? '').trim());
         break;
     }
   }

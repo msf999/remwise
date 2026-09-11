@@ -114,10 +114,15 @@ export const SOURCE_SLOTS = {
 /**
  * Source fields the re-sync may refresh (diffed by `diffSource`, written by `applyUpdate`). `name` is
  * the document TITLE (a `displayTitle`, reconciled via `setText` — not a slot); the rest are slots.
- * `cover` + `readwiseUrl` are deliberately NOT here: they're written on create only (diffing
- * images/link-rems causes phantom diffs). `tags` is user-owned and never touched.
+ * `tags` is user-owned and never touched.
+ *
+ * `readwise` (the `readwiseUrl` slot) and `cover` are here ONLY so a CORRUPTED slot can be repaired —
+ * they are still never value-diffed, because a link rem renders as a page title and an image element
+ * never round-trips, so comparing either stages a row that can never be satisfied (the Zot2Rem lesson).
+ * `diffSource` reaches them exclusively through the STRUCTURAL `slotHealth` check. See the self-heal
+ * block there and the 2026-09-11 changelog entry.
  */
-export const SOURCE_UPDATABLE = ['name', 'author', 'category', 'location', 'link'] as const;
+export const SOURCE_UPDATABLE = ['name', 'author', 'category', 'location', 'link', 'readwise', 'cover'] as const;
 export type UpdatableField = (typeof SOURCE_UPDATABLE)[number];
 
 /**

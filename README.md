@@ -155,14 +155,6 @@ by him.
 | **Make source docs Incremental** | Off | Enrol source documents into [Incremental Everything](https://github.com/bjsi/incremental-everything) (due today): every new source, and any existing source that gains a new highlight. Requires that plugin (otherwise silently skipped). Reload Incremental Everything (or Remnote) after a sync for enrolled docs to enter the queue. |
 
 > [!NOTE]
-> **Upgrading from an earlier version?** Just sync. Existing documents are renamed to `Author - Title`
-> as ordinary *Will update source → name* rows, and any document an older version created for a
-> supplemental turns up as a *Will merge supplement documents* row that **moves** its bullets (so your
-> edits, tags and flashcards are kept) under the source's Supplements heading and deletes the emptied
-> document. Review and apply them like anything else. The popup's fallback panel is only for a
-> supplemental you have since deleted in Readwise, which a sync can no longer see.
-
-> [!NOTE]
 > Every sync re-checks your **whole** Readwise library (one export call, plus a throttled sweep of your
 > Reader documents for their locations). Already-synced items stay _Already in sync_ — nothing is ever
 > re-imported or duplicated, so applying a few rows at a time is always safe.

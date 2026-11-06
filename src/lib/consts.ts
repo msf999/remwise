@@ -69,7 +69,7 @@ export const DISAMBIG_SEP = ' — ';
  * Readwise's `supplementals` category (its curated popular highlights for a book). These are NOT given
  * their own source document: their highlights live under a `Supplements` header inside the MAIN
  * source's document (matched by title + author). Docs created for a supplemental by an older version
- * are folded in by the one-time migration in the Sync popup.
+ * are folded in by the sync, like any supplement document (see `SUPPLEMENT_DOC_SUFFIX`).
  */
 export const SUPPLEMENTAL_CATEGORY = 'supplementals';
 /** Name of the header-1 rem holding a source's supplemental highlights. */

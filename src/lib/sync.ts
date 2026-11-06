@@ -259,8 +259,8 @@ async function getSlotRichText(rem: PluginRem, slot: string): Promise<RichTextIn
   }
 }
 
-/** Rem id → resolved name. Passed around instead of the whole SyncContext so the one-time migration
- *  (which has no sync context) can resolve slot references too. */
+/** Rem id → resolved name. Passed around on its own rather than as part of the whole SyncContext, so
+ *  the slot helpers (`slotToComparable`, `slotHealth`) can run without one. */
 export type RefNameCache = Map<string, string>;
 
 async function resolveRefName(plugin: RNPlugin, cache: RefNameCache, id: string): Promise<string> {
@@ -769,8 +769,9 @@ function nameAtDepth(base: string, category: string, userBookId: number, depth: 
  * grouping by `Author - Title` built from the stored `baseTitle` + Author property (the doc name is
  * never parsed). All members of a colliding group get the next component together:
  * `Author - Title` → `Author - Title — Category` → `Author - Title — Category — [id]`.
- * `skipRemIds` leaves docs out entirely (legacy supplemental docs, which the migration will remove —
- * they share their main doc's title+author and would otherwise force a needless escalation).
+ * `skipRemIds` leaves docs out entirely: supplement docs a staged merge will delete (they share their
+ * main doc's title+author and would otherwise force a needless escalation), and docs whose author
+ * can't be trusted this run.
  * Returns name maps keyed by existing rem id and by new userBookId.
  */
 async function computeDisplayNames(
@@ -2025,7 +2026,7 @@ export async function applySyncPlan(
   // the create phase above.
   for (const move of selection.toMergeSupplementDocs) {
     try {
-      merged += await foldSupplementDoc(plugin, move, 'apply', log);
+      merged += await foldSupplementDoc(plugin, move, log);
       mergedDocs += 1;
       onItemDone(move.id, true);
     } catch (err) {
@@ -2045,21 +2046,16 @@ export async function applySyncPlan(
   return { created, updated, highlightsAdded, supplementsAdded, highlightsFailed, mergedDocs, foldedLookups, failed };
 }
 
-// ─────────── One-time migration: fold legacy supplemental documents into their main document ───────────
+// ───────────────────────── Supplement documents: fold one into its main document ──
 //
-// An older version gave every Readwise `supplementals` source its OWN document under `Sources/`.
-// Supplements now live under a `Supplements` header-1 rem inside the main source's document, so those
-// old documents have to be folded in. The bullets are REPARENTED, never copied — so highlights the
-// user has edited, tagged or turned into flashcards keep their identity, history and scheduling.
-//
-// Titles are NOT migrated here: the normal sync already stages a `name` change for every document
-// whose name isn't `Author - Title`, so renaming is previewable and opt-out row by row.
-//
-// This whole section is temporary — delete it (and the popup's migration panel) once every KB is
-// migrated.
+// A supplemental whose main source isn't in RemNote yet is kept in its own `… - Supplement` document
+// (an older version gave EVERY supplemental one). Once the main document exists, the sync stages a
+// `toMergeSupplementDocs` row that folds it in under the main document's `Supplements` header-1 rem.
+// The bullets are REPARENTED, never copied — so highlights the user has edited, tagged or turned into
+// flashcards keep their identity, history and scheduling.
 
-/** One supplement document and the main document it will be folded into. Produced by the normal sync
- *  (`toMergeSupplementDocs`) and by the one-time migration panel; applied by `foldSupplementDoc`. */
+/** One supplement document and the main document it will be folded into. Staged by the sync
+ *  (`toMergeSupplementDocs`) and applied by `foldSupplementDoc`. */
 export interface SupplementMerge {
   id: string; // `mg:<remId>`
   supplementName: string;
@@ -2068,37 +2064,10 @@ export interface SupplementMerge {
   supplementBookId: number;
   targetName: string;
   targetRem: PluginRem;
-  /** Non-structural children (highlights + any body bullets) that will move. Omitted by the normal
-   *  sync: counting them costs an `isStructuralRem` probe per child, which is far too expensive at plan
-   *  time across a whole library. The one-time panel (few docs, no fetch) does count them. */
-  bulletCount?: number;
-  /** Ledger ids that will be merged into the main document. */
+  /** Ledger ids that will be merged into the main document. The popup shows this rather than how many
+   *  bullets will move: counting those costs an `isStructuralRem` probe per child, far too expensive at
+   *  plan time across a whole library. */
   ledgerCount: number;
-}
-
-/** A legacy supplemental document that can't be folded in (left completely untouched). */
-export interface MigrationSkip {
-  id: string;
-  name: string;
-  reason: string;
-}
-
-export interface MigrationPlan {
-  moves: SupplementMerge[];
-  skipped: MigrationSkip[];
-  /** Source documents scanned, and how many of them are supplemental documents. */
-  scanned: number;
-  legacy: number;
-}
-
-interface MigrationDoc {
-  rem: PluginRem;
-  userBookId: number;
-  name: string;
-  baseTitle: string;
-  author: string;
-  category: string;
-  ledger: Set<string>;
 }
 
 /** Count the children that would actually move (skipping RemNote's property/slot machinery). */
@@ -2112,105 +2081,17 @@ async function movableChildren(rem: PluginRem): Promise<PluginRem[]> {
 }
 
 /**
- * Work out which documents under `Sources/` were created for a supplemental (their Category property
- * reads "Supplementals") and which main document each should fold into — matched on title + author,
- * falling back to a unique title-only match. Reads only RemNote: no Readwise API call, so it works
- * offline and can't be affected by a fetch failure. Changes nothing.
- */
-export async function planSupplementMigration(plugin: RNPlugin, log?: SyncLog): Promise<MigrationPlan> {
-  log?.section('Plan migration (fold supplemental documents)');
-  const cache: RefNameCache = new Map();
-  const sourcesDoc = await findSourcesParent(plugin);
-  if (!sourcesDoc) {
-    log?.log('migrate', 'No Readwise/Sources document — nothing to migrate.');
-    return { moves: [], skipped: [], scanned: 0, legacy: 0 };
-  }
-
-  const legacy: MigrationDoc[] = [];
-  const mains: MigrationDoc[] = [];
-  for (const child of await sourcesDoc.getChildrenRem()) {
-    if (await isStructuralRem(child)) continue;
-    if (!(await child.hasPowerup(SOURCE_POWERUP))) continue;
-    const name = await remName(plugin, child);
-    const author = await slotToComparable(plugin, cache, await getSlotRichText(child, SOURCE_SLOTS.author));
-    const category = await slotToComparable(plugin, cache, await getSlotRichText(child, SOURCE_SLOTS.category));
-    const storedBase = await getProp(child, SOURCE_SLOTS.baseTitle);
-    const baseTitle = storedBase || rawTitleFromName(name, author);
-    const ledger = await readLedger(child, log);
-    const userBookId = Number(await getProp(child, SOURCE_SLOTS.userBookId));
-    const doc: MigrationDoc = {
-      rem: child,
-      userBookId: Number.isFinite(userBookId) ? userBookId : 0,
-      name,
-      baseTitle,
-      author,
-      category,
-      ledger,
-    };
-    if (isSupplementDocCategory(category)) legacy.push(doc);
-    else mains.push(doc);
-  }
-
-  const byTitleAuthor = new Map<string, MigrationDoc[]>();
-  const byTitle = new Map<string, MigrationDoc[]>();
-  for (const d of mains) {
-    for (const [m, k] of [
-      [byTitleAuthor, titleAuthorKey(d.baseTitle, d.author)],
-      [byTitle, titleOnlyKey(d.baseTitle)],
-    ] as [Map<string, MigrationDoc[]>, string][]) {
-      const arr = m.get(k);
-      if (arr) arr.push(d);
-      else m.set(k, [d]);
-    }
-  }
-
-  const moves: SupplementMerge[] = [];
-  const skipped: MigrationSkip[] = [];
-  for (const d of legacy) {
-    const exact = byTitleAuthor.get(titleAuthorKey(d.baseTitle, d.author)) ?? [];
-    const loose = byTitle.get(titleOnlyKey(d.baseTitle)) ?? [];
-    const oldestFirst = (a: MigrationDoc, b: MigrationDoc): number => a.rem.createdAt - b.rem.createdAt;
-    const target = [...exact].sort(oldestFirst)[0] ?? (loose.length === 1 ? loose[0] : undefined);
-    if (!target || target.rem._id === d.rem._id) {
-      skipped.push({
-        id: `mg:${d.rem._id}`,
-        name: d.name,
-        reason: loose.length > 1 ? 'several documents share this title — no unique match' : 'no matching main document',
-      });
-      continue;
-    }
-    const bullets = await movableChildren(d.rem);
-    moves.push({
-      id: `mg:${d.rem._id}`,
-      supplementName: d.name,
-      supplementRem: d.rem,
-      supplementBookId: d.userBookId,
-      targetName: target.name,
-      targetRem: target.rem,
-      bulletCount: bullets.length,
-      ledgerCount: d.ledger.size,
-    });
-  }
-  log?.log(
-    'migrate',
-    `Scanned ${legacy.length + mains.length} source doc(s): ${legacy.length} supplemental, ${moves.length} foldable, ${skipped.length} unmatched.`
-  );
-  return { moves, skipped, scanned: legacy.length + mains.length, legacy: legacy.length };
-}
-
-/**
  * Fold ONE supplement document into its main document: REPARENT every bullet under the main doc's
  * `Supplements` header (created on first use), merge the ledgers, then remove the emptied document.
  * Bullets are MOVED, not copied, so user edits, tags and flashcards keep their rem identity and
  * scheduling. A document that still holds bullets afterwards is LEFT ALONE (never removed). Returns
  * the number of bullets moved; throws if anything fails (the caller counts the row as failed and the
- * document stays put, so the fold is simply retried next run). Shared by the normal sync's
- * `toMergeSupplementDocs` phase and the one-time migration panel.
+ * document stays put, so the fold is simply retried next run). Applies the sync's
+ * `toMergeSupplementDocs` rows.
  */
 async function foldSupplementDoc(
   plugin: RNPlugin,
   move: SupplementMerge,
-  scope: string,
   log?: SyncLog
 ): Promise<number> {
   let bullets = 0;
@@ -2236,54 +2117,19 @@ async function foldSupplementDoc(
   // holding doc also carries body bullets, so this can over-report — hence "up to".
   if (bullets > suppLedger.size)
     log?.log(
-      scope,
+      'apply',
       `  NOTE: "${move.supplementName}" moved ${bullets} bullet(s) but recorded only ${suppLedger.size} — up to ${bullets - suppLedger.size} may be copied again on the next sync; delete any duplicate under "${move.targetName}" → Supplements.`
     );
 
   const left = await movableChildren(move.supplementRem);
   if (left.length === 0) {
     await move.supplementRem.remove();
-    log?.log(scope, `Folded "${move.supplementName}" into "${move.targetName}" and removed the empty document.`);
+    log?.log('apply', `Folded "${move.supplementName}" into "${move.targetName}" and removed the empty document.`);
   } else {
     log?.log(
-      scope,
+      'apply',
       `Folded "${move.supplementName}" into "${move.targetName}", but ${left.length} bullet(s) remain — the document was NOT removed; check it and delete it by hand.`
     );
   }
   return bullets;
-}
-
-/**
- * Fold the selected supplemental documents in: REPARENT every bullet under the main document's
- * `Supplements` header (created on first use), merge the ledgers so a later sync can't re-copy them,
- * then remove the emptied document. A document that still has bullets after the move is LEFT ALONE
- * (never removed) and reported. Per-move `onItemDone` drives the popup's progress.
- */
-export async function applySupplementMigration(
-  plugin: RNPlugin,
-  moves: SupplementMerge[],
-  callbacks: ApplyCallbacks = {},
-  log?: SyncLog
-): Promise<{ folded: number; bullets: number; failed: number }> {
-  const onItemDone = callbacks.onItemDone ?? (() => {});
-  log?.section('Apply migration (fold supplemental documents)');
-  let folded = 0;
-  let bullets = 0;
-  let failed = 0;
-
-  for (const move of moves) {
-    try {
-      bullets += await foldSupplementDoc(plugin, move, 'migrate', log);
-      folded += 1;
-      onItemDone(move.id, true);
-    } catch (err) {
-      failed += 1;
-      log?.log('migrate', `MIGRATION FAILED for "${move.supplementName}": ${errMsg(err)}`);
-      onItemDone(move.id, false);
-    }
-    await yieldToHost();
-  }
-
-  log?.log('migrate', `Migration done: ${folded} document(s) folded, ${bullets} bullet(s) moved, ${failed} failed.`);
-  return { folded, bullets, failed };
 }

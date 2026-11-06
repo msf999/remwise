@@ -12,13 +12,10 @@ import {
   verifyToken,
 } from '../lib/readwiseApi';
 import {
-  applySupplementMigration,
   applySyncPlan,
   type ApplySelection,
   buildSyncContext,
   computeSyncPlan,
-  type MigrationPlan,
-  planSupplementMigration,
   type SourceCreateEntry,
   type SyncContext,
   type SyncPlan,
@@ -91,15 +88,6 @@ const headerStyle: CSSProperties = {
   fontWeight: 600,
 };
 const bodyStyle: CSSProperties = { padding: '4px 12px 10px 12px' };
-const smallBtn: CSSProperties = {
-  padding: '2px 8px',
-  borderRadius: 5,
-  border: '1px solid #d1d5db',
-  background: 'transparent',
-  color: 'inherit',
-  fontSize: 12,
-  cursor: 'pointer',
-};
 
 /** Select-all state for a section header; omitted for a read-only section. */
 interface SelectAll {
@@ -150,8 +138,6 @@ export const ReadwiseSync = () => {
   const [busy, setBusy] = useState(false);
   /** True only while applySyncPlan is running — drives the compact panel that hides the big list. */
   const [syncApplying, setSyncApplying] = useState(false);
-  /** True while the fallback migration is reparenting and deleting. */
-  const [migApplying, setMigApplying] = useState(false);
   const [applied, setApplied] = useState(false);
   const [plan, setPlan] = useState<SyncPlan | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -161,16 +147,6 @@ export const ReadwiseSync = () => {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set(['already', 'log']));
   const [hasLog, setHasLog] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
-  // One-time migration (fold old supplemental documents). Temporary — remove with the panel below.
-  const [migPlan, setMigPlan] = useState<MigrationPlan | null>(null);
-  const [migSelected, setMigSelected] = useState<Set<string>>(new Set());
-  const [migStatus, setMigStatus] = useState('');
-  const [migConfirm, setMigConfirm] = useState(false);
-  const [migApplied, setMigApplied] = useState(false);
-  // The panel and the sync both mint `mg:<remId>` ids, so the panel keeps its OWN marks — sharing
-  // `done`/`failed` made a sync merge paint ✅/❌ on a migration row that never ran.
-  const [migDone, setMigDone] = useState<Set<string>>(new Set());
-  const [migFailed, setMigFailed] = useState<Set<string>>(new Set());
 
   const ctxRef = useRef<SyncContext | null>(null);
   const logRef = useRef<SyncLog | null>(null);
@@ -434,10 +410,6 @@ export const ReadwiseSync = () => {
         log
       );
       setApplied(true);
-      // The sync's own merge phase folds and deletes the documents the panel lists, so its plan is dead.
-      setMigPlan(null);
-      setMigSelected(new Set());
-      setMigConfirm(false);
       // `problems` is for FAILURES only — anything listed there ends with "retry them".
       const problems: string[] = [];
       if (result.highlightsFailed) problems.push(`${result.highlightsFailed} highlight(s) failed`);
@@ -461,101 +433,6 @@ export const ReadwiseSync = () => {
       setHasLog(true);
       setSyncApplying(false);
       setBusy(false);
-    }
-  };
-
-  // ── One-time migration (temporary — remove with the panel at the bottom) ───────────────────────
-  const migToggle = (id: string) =>
-    setMigSelected((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-
-  const handleMigPreview = async () => {
-    setBusy(true);
-    setMigConfirm(false);
-    setMigStatus('Scanning your Readwise source documents…');
-    const log = logRef.current ?? new SyncLog();
-    logRef.current = log;
-    try {
-      const mp = await planSupplementMigration(plugin, log);
-      setMigPlan(mp);
-      setMigApplied(false); // only once a FRESH plan exists — a failed scan must not re-arm the button
-      setMigSelected(new Set(mp.moves.map((m) => m.id)));
-      setMigStatus(
-        mp.legacy === 0
-          ? `Nothing to migrate — none of the ${mp.scanned} source document(s) is a supplemental.`
-          : `${mp.moves.length} supplemental document(s) can be folded in` +
-              (mp.skipped.length ? `; ${mp.skipped.length} have no matching source and will be left alone.` : '.')
-      );
-    } catch (err) {
-      const m = errText(err);
-      log.log('error', m);
-      // Drop the old plan: its rems may already be migrated (and removed), so it must not stay actionable.
-      setMigPlan(null);
-      setMigSelected(new Set());
-      setMigStatus(`Migration preview failed: ${m}`);
-      await plugin.app.toast(`Migration preview failed: ${m}`);
-    } finally {
-      setHasLog(true);
-      setBusy(false);
-    }
-  };
-
-  const handleMigApply = async () => {
-    const mp = migPlan;
-    if (!mp) return;
-    const moves = mp.moves.filter((m) => migSelected.has(m.id));
-    if (!moves.length) {
-      await plugin.app.toast('Nothing selected to migrate.');
-      return;
-    }
-    setBusy(true);
-    setMigApplying(true);
-    setMigConfirm(false);
-    setMigDone(new Set());
-    setMigFailed(new Set());
-    setProgress({ completed: 0, total: moves.length });
-    setMigStatus('Migrating…');
-    const log = logRef.current ?? new SyncLog();
-    logRef.current = log;
-    try {
-      const r = await applySupplementMigration(
-        plugin,
-        moves,
-        {
-          onItemDone: (id, ok) => {
-            setProgress((pr) => (pr ? { completed: pr.completed + 1, total: pr.total } : pr));
-            (ok ? setMigDone : setMigFailed)((prev) => new Set(prev).add(id));
-          },
-        },
-        log
-      );
-      if (!mountedRef.current) return;
-      setMigApplied(true);
-      // The migration deleted documents the loaded sync plan may still reference, so that plan is dead.
-      setPlan(null);
-      setSelected(new Set());
-      ctxRef.current = null;
-      setStatus('Migration finished — click "Get from Readwise" for a fresh plan.');
-      const msg =
-        `Migration done — ${r.folded} document(s) folded in, ${r.bullets} bullet(s) moved` +
-        (r.failed ? `, ${r.failed} failed (see the log).` : '.');
-      setMigStatus(msg);
-      await plugin.app.toast(msg);
-    } catch (err) {
-      const m = errText(err);
-      log.log('error', m);
-      setMigStatus(`Migration failed: ${m}`);
-      await plugin.app.toast(`Migration failed: ${m}`);
-    } finally {
-      if (mountedRef.current) {
-        setProgress(null);
-        setHasLog(true);
-        setMigApplying(false);
-        setBusy(false);
-      }
     }
   };
 
@@ -602,8 +479,8 @@ export const ReadwiseSync = () => {
   // Re-rendering that whole tree on every applied item — on top of the apply's own thousands of SDK
   // calls — can exhaust the plugin-widget iframe's renderer memory, and the browser kills the frame (the
   // grey "sad tab" crash on big syncs). During apply we render only a compact progress panel; the full
-  // list returns with ✅/❌ once `applied` flips true. Keyed on the sync apply ALONE: the migration
-  // below also sets `busy`, and it must not be mistaken for (or hidden by) a sync apply.
+  // list returns with ✅/❌ once `applied` flips true. Keyed on the sync apply ALONE, not on `busy`,
+  // which the preview's fetch sets too.
   const applying = syncApplying;
 
   return (
@@ -645,9 +522,9 @@ export const ReadwiseSync = () => {
         </button>
         <button
           onClick={() => plugin.widget.closePopup()}
-          disabled={syncApplying || migApplying}
+          disabled={syncApplying}
           title={
-            syncApplying || migApplying
+            syncApplying
               ? 'Wait — closing now would leave the knowledge base half-written'
               : 'Close'
           }
@@ -655,8 +532,8 @@ export const ReadwiseSync = () => {
             padding: '4px 10px',
             borderRadius: 6,
             border: '1px solid #d1d5db',
-            cursor: syncApplying || migApplying ? 'default' : 'pointer',
-            opacity: syncApplying || migApplying ? 0.5 : 1,
+            cursor: syncApplying ? 'default' : 'pointer',
+            opacity: syncApplying ? 0.5 : 1,
           }}
         >
           ✕
@@ -808,11 +685,9 @@ export const ReadwiseSync = () => {
                     {m.supplementName} <span style={{ color: '#6b7280' }}>→ {m.targetName}</span>
                     <span style={{ color: '#6b7280' }}>
                       {' '}· its bullets move under “Supplements”
-                      {m.bulletCount === undefined
-                        ? m.ledgerCount
-                          ? ` (${m.ledgerCount} highlight${m.ledgerCount === 1 ? '' : 's'} recorded)`
-                          : ''
-                        : ` (${m.bulletCount} bullet${m.bulletCount === 1 ? '' : 's'})`}
+                      {m.ledgerCount
+                        ? ` (${m.ledgerCount} highlight${m.ledgerCount === 1 ? '' : 's'} recorded)`
+                        : ''}
                       , then the document is deleted once empty
                     </span>
                     {mark(m.id)}
@@ -859,89 +734,6 @@ export const ReadwiseSync = () => {
               ))}
             </Section>
           </>
-        )}
-
-        {/* ── One-time migration panel. TEMPORARY: delete this block (and the handlers + the migration
-            functions in sync.ts) once every knowledge base has been migrated. ── */}
-        {!applying && (
-          <div style={{ ...sectionStyle, borderColor: '#fcd34d' }}>
-            <div style={headerStyle} onClick={() => toggleCollapse('migrate')}>
-              <span style={{ width: 14 }}>{collapsed.has('migrate') ? '▸' : '▾'}</span>
-              <span>Fallback — fold leftover “Supplemental” documents in</span>
-            </div>
-            {!collapsed.has('migrate') && (
-              <div style={bodyStyle}>
-                <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 8, lineHeight: 1.5 }}>
-                  <b>You usually don’t need this.</b> The normal sync stages a <b>Will merge supplement documents</b> row
-                  on its own for every supplement document it can match — including ones whose Readwise source has since
-                  been deleted, which it recognises by their Category property and their name. Titles arrive as ordinary{' '}
-                  <b>name</b> rows. This panel is a fallback for when you want to fold documents in <b>without fetching
-                  from Readwise at all</b> (offline, or a bad token). It does the same thing: moves their bullets under the{' '}
-                  <b>Supplements</b> heading of the matching source document, merges the sync records, then deletes the
-                  emptied document. Highlights are <b>moved, not copied</b>, so edits, tags and flashcards are kept.
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  <button onClick={handleMigPreview} disabled={busy} style={{ ...smallBtn, padding: '4px 10px' }}>
-                    {migPlan ? 'Re-scan' : 'Preview migration'}
-                  </button>
-                  {migPlan && migPlan.moves.length > 0 && !migApplied && (
-                    !migConfirm ? (
-                      <button
-                        onClick={() => setMigConfirm(true)}
-                        disabled={busy || migSelected.size === 0}
-                        style={{ ...smallBtn, padding: '4px 10px', borderColor: '#b45309', color: '#b45309' }}
-                      >
-                        Migrate {migSelected.size} document{migSelected.size === 1 ? '' : 's'}
-                      </button>
-                    ) : (
-                      <span style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                        <span style={{ color: '#b45309', fontSize: 12 }}>
-                          Move the bullets of {migSelected.size} document{migSelected.size === 1 ? '' : 's'} and delete the
-                          emptied document{migSelected.size === 1 ? '' : 's'}?
-                        </span>
-                        <button
-                          onClick={handleMigApply}
-                          disabled={busy}
-                          style={{ ...smallBtn, borderColor: '#dc2626', color: '#dc2626' }}
-                        >
-                          Migrate
-                        </button>
-                        <button onClick={() => setMigConfirm(false)} disabled={busy} style={smallBtn}>
-                          Cancel
-                        </button>
-                      </span>
-                    )
-                  )}
-                  {migStatus && <span style={{ fontSize: 12, color: '#374151' }}>{migStatus}</span>}
-                </div>
-
-                {migPlan?.moves.map((m) => (
-                  <div key={m.id} style={{ ...rowStyle, paddingLeft: 4 }}>
-                    <Check
-                      checked={migSelected.has(m.id)}
-                      disabled={busy || migApplied}
-                      onChange={() => migToggle(m.id)}
-                    />
-                    <span>
-                      {m.supplementName} <span style={{ color: '#6b7280' }}>→ {m.targetName}</span>
-                      <span style={{ color: '#6b7280' }}>
-                        {' '}· {m.bulletCount} bullet{m.bulletCount === 1 ? '' : 's'}
-                      </span>
-                      {migDone.has(m.id) ? ' ✅' : migFailed.has(m.id) ? ' ❌' : ''}
-                    </span>
-                  </div>
-                ))}
-                {migPlan?.skipped.map((k) => (
-                  <div key={k.id} style={{ ...rowStyle, paddingLeft: 4, color: '#6b7280' }}>
-                    <span style={{ width: 22 }} />
-                    <span>
-                      {k.name} · left alone ({k.reason})
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
         )}
 
         {/* The Log box is also hidden while applying: its text is re-joined from every line on each

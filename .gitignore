@@ -11,8 +11,10 @@ Information/
 # Machine-local Claude Code settings (permissions etc.) — not shared.
 .claude/
 
-# Project dev guide — synced across machines via iCloud, kept out of git.
+# Project notes — kept out of git: the dev guide (essentials), the dated work log, the open reminders.
 CLAUDE.md
+LOG.md
+REMINDERS.md
 
 # Built plugin bundle (already matched by *.zip above; listed explicitly too).
 PluginZip.zip

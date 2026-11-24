@@ -6,8 +6,8 @@
   "repoUrl": "https://github.com/msf999/remwise",
   "version": {
     "major": 0,
-    "minor": 5,
-    "patch": 1
+    "minor": 6,
+    "patch": 0
   },
   "theme": [],
   "enableOnMobile": false,

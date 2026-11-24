@@ -9,10 +9,17 @@ export const SETTINGS = {
   /** When ON, apply each highlight's Readwise color as a RemNote highlight color. Default OFF. */
   applyColors: 'readwise-apply-colors',
   /**
-   * When ON, enrol a source doc in Incremental Everything: every newly-created source, AND any
-   * existing source not yet incremental that gains a new highlight on a later sync.
+   * When ON, enrol source docs in Incremental Everything — WHEN is decided by `readerOnlyWhenArchived`.
+   * (The id predates that option, when "on create" was the only behaviour; ids are permanent.)
    */
   initIncremental: 'init-incremental-on-create',
+  /**
+   * Default ON. Narrows `initIncremental` for READER sources: one is enrolled only once it is DONE —
+   * archived in Readwise Reader. Every other source keeps the original rule (enrolled on create, or when
+   * it gains a new highlight), because only Reader documents carry a "done" signal: the v2 export has no
+   * finished/read flag at all (the user's choice, 2026-11-24). OFF = the original rule for every source.
+   */
+  readerOnlyWhenArchived: 'incremental-reader-only-when-archived',
 } as const;
 
 /** The five Readwise source categories. Each gets its own "include" boolean setting (default ON). */
@@ -54,6 +61,15 @@ export const IE = {
   defaultPriority: 10,
   /** IE's default rotation value (the rotation slot holds this unless inherited from a parent). */
   defaultRotation: 'Default',
+  /**
+   * The powerup IE moves a rem to when the user DISMISSES it ("finish this item for good"): IE adds
+   * `dismissed` (holding the rep history) and removes `incremental` — see incremental-everything-mo's
+   * `src/lib/dismissed/index.ts` (`transferToDismissed`) and `src/lib/consts.ts` (`dismissedPowerupCode`).
+   * A doc carrying it is never enrolled again: re-adding `incremental` would undo the user's decision,
+   * and leave the rem holding BOTH powerups, a state IE itself never creates (its own re-activation
+   * removes `dismissed` and merges the history back).
+   */
+  dismissedPowerup: 'dismissed',
 } as const;
 
 /**
@@ -146,6 +162,9 @@ export const LOCATION_LABEL: Record<string, string> = {
   feed: 'Feed',
 };
 export const NOT_IN_READER = 'Not in Reader';
+/** The Reader `location` that means the user has FINISHED a document — the "done" signal the
+ *  "…Reader sources only once archived" option keys on. Nothing outside Reader says when a thing is done. */
+export const READER_ARCHIVE = 'archive';
 
 /**
  * Readwise highlight `color` → RemNote highlight-color format token (a `RichTextFormatName`).

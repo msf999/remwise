@@ -88,6 +88,9 @@ const headerStyle: CSSProperties = {
   fontWeight: 600,
 };
 const bodyStyle: CSSProperties = { padding: '4px 12px 10px 12px' };
+/** Appended to a create / add row that also enrols its doc in Incremental Everything (decided by the
+ *  plan: `makeIncremental` on the entry). An ARCHIVED Reader doc gets its own section instead. */
+const INC_HINT = ' · will be made Incremental';
 
 /** Select-all state for a section header; omitted for a read-only section. */
 interface SelectAll {
@@ -299,6 +302,7 @@ export const ReadwiseSync = () => {
       for (const e of p.toAddSupplements) for (const h of e.highlights) sel.add(`${e.id}:${h.id}`);
       for (const m of p.toMergeSupplementDocs) sel.add(m.id);
       for (const d of p.toFoldLookupDuplicates) sel.add(d.id);
+      for (const e of p.toMakeIncremental) sel.add(e.id);
       setSelected(sel);
 
       const hlToAdd = p.toAddHighlights.reduce((n, g) => n + g.highlights.length, 0);
@@ -309,7 +313,8 @@ export const ReadwiseSync = () => {
         hlToAdd +
         supToAdd +
         p.toMergeSupplementDocs.length +
-        p.toFoldLookupDuplicates.length;
+        p.toFoldLookupDuplicates.length +
+        p.toMakeIncremental.length;
       // The empty-plan message keys off WHY it's empty: nothing fetched / nothing matched the tag filter
       // within the included categories (naming both filters, since `matchingHighlights` only counts
       // category-included sources) / everything already copied — not just the raw fetch count.
@@ -321,7 +326,8 @@ export const ReadwiseSync = () => {
           ? `Found ${p.fetchedSources} sources (${p.matchingHighlights} matching highlights) — ` +
               `${p.toCreateSources.length} to create, ${p.toUpdateSources.length} source update(s), ${hlToAdd} highlight(s)` +
               `${supToAdd ? ` and ${supToAdd} supplement(s)` : ''} to add` +
-              `${p.toMergeSupplementDocs.length ? `, ${p.toMergeSupplementDocs.length} supplement document(s) to fold in` : ''}.`
+              `${p.toMergeSupplementDocs.length ? `, ${p.toMergeSupplementDocs.length} supplement document(s) to fold in` : ''}` +
+              `${p.toMakeIncremental.length ? `, ${p.toMakeIncremental.length} archived source(s) to make Incremental` : ''}.`
           : p.fetchedSources === 0
             ? 'Readwise returned no sources for this account.'
             : p.matchingHighlights === 0
@@ -376,6 +382,7 @@ export const ReadwiseSync = () => {
         .filter((x) => x.highlightIds.size > 0),
       toMergeSupplementDocs: p.toMergeSupplementDocs.filter((m) => selected.has(m.id)),
       toFoldLookupDuplicates: p.toFoldLookupDuplicates.filter((d) => selected.has(d.id)),
+      toMakeIncremental: p.toMakeIncremental.filter((e) => selected.has(e.id)),
     };
 
     const total =
@@ -384,7 +391,8 @@ export const ReadwiseSync = () => {
       selection.toAddHighlights.length +
       selection.toAddSupplements.length +
       selection.toMergeSupplementDocs.length +
-      selection.toFoldLookupDuplicates.length;
+      selection.toFoldLookupDuplicates.length +
+      selection.toMakeIncremental.length;
     if (total === 0) {
       await plugin.app.toast('Nothing selected to apply.');
       return;
@@ -421,6 +429,7 @@ export const ReadwiseSync = () => {
         ' added' +
         (result.mergedDocs ? `, ${result.mergedDocs} supplement document(s) folded in` : '') +
         (result.foldedLookups ? `, ${result.foldedLookups} duplicate lookup rem(s) folded` : '') +
+        (result.madeIncremental ? `, ${result.madeIncremental} made Incremental` : '') +
         (problems.length ? `; ${problems.join(', ')}. Click Refresh to re-check and retry them.` : '.');
       setStatus(msg);
       await plugin.app.toast(msg);
@@ -473,6 +482,7 @@ export const ReadwiseSync = () => {
   const supLeafIds = plan ? plan.toAddSupplements.flatMap((e) => e.highlights.map((h) => `${e.id}:${h.id}`)) : [];
   const mergeLeafIds = plan ? plan.toMergeSupplementDocs.map((m) => m.id) : [];
   const dupLeafIds = plan ? plan.toFoldLookupDuplicates.map((d) => d.id) : [];
+  const incLeafIds = plan ? plan.toMakeIncremental.map((e) => e.id) : [];
 
   const pct = progress && progress.total > 0 ? Math.round((progress.completed / progress.total) * 100) : 0;
   // While an apply is in flight, hide the (potentially 1000+ row) results list AND the Log box.
@@ -610,6 +620,7 @@ export const ReadwiseSync = () => {
                               ? ` · ${e.supplements.length} supplement${e.supplements.length === 1 ? '' : 's'}`
                               : ''}
                             {e.isSupplementDoc ? ' · no source document yet — held here until one appears' : ''}
+                            {e.makeIncremental ? INC_HINT : ''}
                           </span>
                           {mark(e.id)}
                         </span>
@@ -643,7 +654,10 @@ export const ReadwiseSync = () => {
               {plan.toAddHighlights.map((e) => (
                 <div key={e.id} style={{ marginBottom: 6 }}>
                   <div style={{ fontWeight: 600 }}>
-                    {e.name} <span style={{ color: '#6b7280' }}>(+{e.highlights.length})</span>
+                    {e.name}{' '}
+                    <span style={{ color: '#6b7280' }}>
+                      (+{e.highlights.length}){e.makeIncremental ? INC_HINT : ''}
+                    </span>
                     {mark(e.id)}
                   </div>
                   {e.highlights.map((h) => (
@@ -660,7 +674,10 @@ export const ReadwiseSync = () => {
               {plan.toAddSupplements.map((e) => (
                 <div key={e.id} style={{ marginBottom: 6 }}>
                   <div style={{ fontWeight: 600 }}>
-                    {e.name} <span style={{ color: '#6b7280' }}>(+{e.highlights.length} under “Supplements”)</span>
+                    {e.name}{' '}
+                    <span style={{ color: '#6b7280' }}>
+                      (+{e.highlights.length} under “Supplements”){e.makeIncremental ? INC_HINT : ''}
+                    </span>
                     {mark(e.id)}
                   </div>
                   {e.highlights.map((h) => (
@@ -669,6 +686,23 @@ export const ReadwiseSync = () => {
                       <span>{clip(h.text)}</span>
                     </div>
                   ))}
+                </div>
+              ))}
+            </Section>
+
+            <Section
+              title="Will make Incremental (archived in Reader)"
+              count={plan.toMakeIncremental.length}
+              {...sectionProps('inc', incLeafIds)}
+            >
+              {plan.toMakeIncremental.map((e) => (
+                <div key={e.id} style={{ ...rowStyle, paddingLeft: 16 }}>
+                  <Check checked={selected.has(e.id)} disabled={busy || applied} onChange={() => toggle(e.id)} />
+                  <span>
+                    {e.name}
+                    <span style={{ color: '#6b7280' }}> · enrolled in Incremental Everything, due today</span>
+                    {mark(e.id)}
+                  </span>
                 </div>
               ))}
             </Section>

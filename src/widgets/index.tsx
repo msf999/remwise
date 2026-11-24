@@ -65,12 +65,27 @@ async function onActivate(plugin: ReactRNPlugin) {
     id: SETTINGS.initIncremental,
     title: 'Make source docs Incremental (Incremental Everything)',
     description:
-      'When ON, Remwise enrols source documents into the Incremental Everything plugin (due today): ' +
-      'every NEW source it creates, and any existing source that is not yet incremental when it gains ' +
-      'a new highlight. Requires that plugin installed; otherwise silently skipped. NOTE: Incremental ' +
-      'Everything only notices newly-enrolled docs after it rebuilds its cache — reload the Incremental ' +
-      'Everything plugin (or RemNote) after a sync for them to enter the queue.',
+      'When ON, Remwise enrols source documents into the Incremental Everything plugin (due today): a new ' +
+      'source as soon as it is created, and an existing one when it gains a new highlight — except that, ' +
+      'by default, a source from Readwise Reader waits until you have archived it there (see the next ' +
+      'setting). Requires that plugin installed; otherwise nothing is enrolled. A document you dismissed ' +
+      'in Incremental Everything is never enrolled again. NOTE: Incremental Everything only notices ' +
+      'newly-enrolled docs after it rebuilds its cache — reload the Incremental Everything plugin (or ' +
+      'RemNote) after a sync for them to enter the queue.',
     defaultValue: false,
+  });
+
+  await plugin.settings.registerBooleanSetting({
+    id: SETTINGS.readerOnlyWhenArchived,
+    title: '…Reader sources only once archived (done)',
+    description:
+      'Applies when "Make source docs Incremental" is ON. When ON (the default), a source from Readwise ' +
+      'Reader is enrolled only once you have finished it, i.e. archived it in Reader; the sync preview ' +
+      'lists each one under "Will make Incremental". Only Reader documents say when they are done, so ' +
+      'every other source (books from Kindle and other e-readers, tweets and podcasts saved outside ' +
+      'Reader, supplementals, manual imports) is enrolled as before: when it is created, or when it gains ' +
+      'a new highlight. When OFF, Reader sources are enrolled that way too.',
+    defaultValue: true,
   });
 
   // ── Powerup: marks a Rem as a synced Readwise source + holds its metadata and dedup ledger ──

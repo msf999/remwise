@@ -59,9 +59,20 @@ as properties, with its highlights as bullets beneath it.
   clash.
 
 ### Incremental Everything (optional)
-When enabled, every source Remwise creates — and any existing source that earns its first new highlight
-— is enrolled in the [Incremental Everything](https://github.com/bjsi/incremental-everything) plugin
-(added to its queue, due today). Requires that plugin installed; otherwise silently skipped.
+When enabled, source documents are enrolled in the
+[Incremental Everything](https://github.com/bjsi/incremental-everything) plugin (added to its queue, due
+today):
+- **Sources from Readwise Reader** wait until you have **finished** them — i.e. **archived** them in
+  Reader (by default). The preview lists each one under *Will make Incremental (archived in Reader)*,
+  ticked, so you can leave any out (it is offered again on the next sync).
+- **Every other source** — books from Kindle and other e-readers, tweets and podcasts saved outside
+  Reader, supplementals, manual imports — is enrolled as soon as it is created, or when it gains a new
+  highlight. Only Reader documents tell Readwise when they are done, so these have nothing to wait for.
+- A document you **dismissed** in Incremental Everything is never enrolled again.
+
+The preview marks every create or add row that will enrol its document (*· will be made Incremental*).
+Turn **…Reader sources only once archived** off to treat Reader sources like the rest. Requires that
+plugin installed; otherwise nothing is enrolled.
 
 ### Preview-then-apply
 The **Sync Readwise** popup never changes anything until you say so. **Get from Readwise** fetches your
@@ -152,7 +163,8 @@ by him.
 | **Tags to copy (comma-separated)** | _(empty)_ | Copy highlights carrying one of these tags (case-insensitive); if a SOURCE itself carries the tag, ALL of its highlights are copied. Empty = copy every highlight. Tip: start with a single tag (e.g. `science`) to see how it looks. |
 | **Apply highlight colors** | Off | On = each highlight's Readwise color (yellow / blue / pink / orange / green / purple) is applied as a Remnote highlight color. Off = highlights import as plain text. |
 | **Include Books / Articles / Tweets / Podcasts / Supplementals** | On (each) | Five toggles — include each Readwise category when syncing. Turn all five off and nothing syncs (the popup tells you so). *Supplementals* adds curated popular highlights to the **Supplements** section of the matching source, not a document of its own. |
-| **Make source docs Incremental** | Off | Enrol source documents into [Incremental Everything](https://github.com/bjsi/incremental-everything) (due today): every new source, and any existing source that gains a new highlight. Requires that plugin (otherwise silently skipped). Reload Incremental Everything (or Remnote) after a sync for enrolled docs to enter the queue. |
+| **Make source docs Incremental** | Off | Enrol source documents into [Incremental Everything](https://github.com/bjsi/incremental-everything) (due today): a new source when it is created, and an existing one when it gains a new highlight — except Reader sources, by default (next setting). A document you dismissed there is never enrolled again. Requires that plugin (otherwise nothing is enrolled). Reload Incremental Everything (or Remnote) after a sync for enrolled docs to enter the queue. |
+| **…Reader sources only once archived (done)** | On | On = a source from Readwise Reader is enrolled only once you have archived it there (listed under *Will make Incremental* in the preview). Every other source has no "done" signal and is enrolled as above. Off = Reader sources are enrolled as above too. |
 
 > [!NOTE]
 > Every sync re-checks your **whole** Readwise library (one export call, plus a throttled sweep of your

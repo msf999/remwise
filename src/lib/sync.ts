@@ -11,6 +11,7 @@ import {
   IE,
   LOCATION_LABEL,
   NOT_IN_READER,
+  READER_ARCHIVE,
   SETTINGS,
   SOURCE_POWERUP,
   SOURCE_SLOTS,
@@ -105,6 +106,11 @@ export interface SourceCreateEntry {
    *  highlights are held in their own `… - Supplement` doc until the main source appears and the sync
    *  stages a merge. Its highlights are plain bullets (the whole document is the supplement). */
   isSupplementDoc: boolean;
+  /** Enrol the new doc in Incremental Everything as part of this create — decided at PLAN time, so the
+   *  preview can say so: always in `always` mode; in `readerWhenArchived` mode for a source archived
+   *  in Reader or one with no "done" signal at all (not in Reader), never for one still being read.
+   *  (A Reader doc created un-archived is offered a `toMakeIncremental` row once it is.) */
+  makeIncremental: boolean;
 }
 
 /** An existing source whose metadata (or name) changed. `source` is undefined for a location-only row. */
@@ -123,6 +129,9 @@ export interface SourceAddHighlights {
   name: string;
   rem: PluginRem;
   highlights: ReadwiseHighlight[]; // selectable ids are `ha:<remId>:<hlId>`
+  /** Enrol the doc in Incremental Everything once ≥1 highlight lands — the original "earned new
+   *  content" rule, decided at PLAN time (incl. that the doc is neither incremental nor dismissed yet). */
+  makeIncremental: boolean;
 }
 
 /** An EXISTING source doc gaining supplemental highlights (under its `Supplements` header). A new
@@ -132,12 +141,44 @@ export interface SupplementAddEntry {
   name: string;
   rem: PluginRem;
   highlights: ReadwiseHighlight[]; // selectable ids are `hs:<remId>:<hlId>`
+  /** As on `SourceAddHighlights`: enrol once ≥1 supplement lands (the original rule). */
+  makeIncremental: boolean;
 }
 
 /** A source already fully in sync (read-only in the preview). */
 export interface KeptEntry {
   id: string; // `k:<remId>`
   name: string;
+}
+
+/**
+ * When source docs are enrolled in Incremental Everything this run (settings + whether IE is installed):
+ *  - `off`                — the setting is off, or IE is not installed: nothing is enrolled.
+ *  - `always`             — the original rule: every new doc on create, and an existing doc when it
+ *                           gains a highlight or supplement (event-driven, riding along with those rows).
+ *  - `readerWhenArchived` — the default. A READER source waits until it is archived (= done): enrolled
+ *                           on create if it already is, else via its own `toMakeIncremental` row once it
+ *                           is (state-driven). Every source with no "done" signal — not in Reader —
+ *                           follows the original rule, as `always` (the user's choice, 2026-11-24).
+ */
+export type IncrementalMode = 'off' | 'always' | 'readerWhenArchived';
+
+/** What this run knows about whether the user has finished a source. Mirrors the Location property:
+ *  - `archived`  — in Reader's archive: done.
+ *  - `reading`   — in Reader, anywhere else (inbox, later, shortlist, feed): not done yet.
+ *  - `no-signal` — not in Reader (no `external_id`, or a COMPLETE sweep did not find it): Kindle and
+ *                  other e-readers, tweets/podcasts saved elsewhere, supplementals, manual imports, a
+ *                  Reader doc since deleted. Readwise has no "done" for these — the v2 export has no
+ *                  finished/read field at all.
+ *  - `unknown`   — a Reader source an INCOMPLETE sweep did not reach. Never read as done. */
+type DoneState = 'archived' | 'reading' | 'no-signal' | 'unknown';
+
+/** An EXISTING doc whose source is archived in Reader and that is neither incremental nor dismissed in
+ *  Incremental Everything yet → enrol it (`readerWhenArchived` mode only). */
+export interface IncrementalEntry {
+  id: string; // `mi:<remId>`
+  name: string;
+  rem: PluginRem;
 }
 
 /** The full set of changes a sync would make (add-only). */
@@ -150,6 +191,10 @@ export interface SyncPlan {
   toMergeSupplementDocs: SupplementMerge[];
   /** Duplicate lookup rems a cross-device race created. Destructive, so it is a row like any other. */
   toFoldLookupDuplicates: LookupDuplicate[];
+  /** Existing docs to enrol in Incremental Everything because their source is now archived in Reader. */
+  toMakeIncremental: IncrementalEntry[];
+  /** The enrolment rule this plan was computed under (the popup words its hints from it). */
+  incMode: IncrementalMode;
   alreadyInSync: KeptEntry[];
   fetchedSources: number;
   matchingHighlights: number;
@@ -211,6 +256,9 @@ export interface SyncContext {
   existingSources: ExistingSource[];
   /** user_book_id → the OLDEST source doc carrying that id. */
   sourceByBookId: Map<number, ExistingSource>;
+  /** Decided once, when the context is built — the preview is the contract, so the apply never
+   *  re-reads the settings (a toggle flipped between preview and apply must not change what it does). */
+  incMode: IncrementalMode;
   incSetup?: IncSetup | null;
 }
 
@@ -616,8 +664,40 @@ async function writeLedger(rem: PluginRem, ids: Set<string>, log?: SyncLog): Pro
 
 // ───────────────────────── Context build + existing scan ─────────────────────────
 
+/**
+ * `getPowerupByCode`, but `undefined` when no ENABLED plugin registers the code. The host does not
+ * resolve to undefined for such a code — it THROWS "Cannot find powerup" — even when the powerup's rem
+ * is still in the knowledge base (found live 2026-11-24 with Incremental Everything switched off: an
+ * unguarded lookup made the whole preview fail whenever "Make source docs Incremental" was on).
+ * `rem.hasPowerup` of an unregistered code is safe: it just answers false.
+ */
+export async function findPowerup(plugin: RNPlugin, code: string): Promise<PluginRem | undefined> {
+  try {
+    return (await plugin.powerup.getPowerupByCode(code)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The Incremental Everything enrolment rule from the two settings, and whether IE is installed. A
+ *  never-set "…Reader sources only once archived" reads as its default, ON. */
+async function readIncrementalMode(plugin: RNPlugin, log?: SyncLog): Promise<IncrementalMode> {
+  if (!(await plugin.settings.getSetting<boolean>(SETTINGS.initIncremental))) return 'off';
+  if (!(await findPowerup(plugin, IE.powerup))) {
+    log?.log(
+      'plan',
+      'Incremental Everything is not installed or not enabled — no source will be made incremental.'
+    );
+    return 'off';
+  }
+  const readerGate = (await plugin.settings.getSetting<boolean>(SETTINGS.readerOnlyWhenArchived)) !== false;
+  return readerGate ? 'readerWhenArchived' : 'always';
+}
+
 /** Build a SyncContext from the popup's inputs (tag filter, included categories and the Reader map are
- *  all read/fetched by the popup and passed in), read the colour setting, and scan existing sources. */
+ *  all read/fetched by the popup and passed in), read the colour and Incremental Everything settings,
+ *  and scan existing sources. `incMode` overrides the settings — for the test suite, which must not
+ *  depend on (or change) the account's settings. */
 export async function buildSyncContext(
   plugin: RNPlugin,
   opts: {
@@ -625,10 +705,33 @@ export async function buildSyncContext(
     included: Set<Category>;
     readerByExternalId: Map<string, ReaderInfo>;
     readerComplete: boolean;
+    incMode?: IncrementalMode;
     log?: SyncLog;
   }
 ): Promise<SyncContext> {
+  // Every property read below goes through the Readwise Source powerup. While it is NOT registered
+  // (seen live 2026-11-24 after a plugin-host restart: "Cannot find powerup readwise-source") each
+  // visible property reads as empty, so the preview staged a bogus "Will update source" row for EVERY
+  // document. The apply already refuses in that state; the preview now refuses too.
+  if (!(await findPowerup(plugin, SOURCE_POWERUP))) {
+    const msg =
+      'Readwise Source powerup is not registered — reload the plugin (toggle it off/on in Settings → ' +
+      'Plugins → Build) and try again. Nothing was compared.';
+    opts.log?.log('plan', `ERROR (precondition): ${msg}`);
+    throw new Error(msg);
+  }
   const applyColors = (await plugin.settings.getSetting<boolean>(SETTINGS.applyColors)) ?? false;
+  const incMode = opts.incMode ?? (await readIncrementalMode(plugin, opts.log));
+  opts.log?.log(
+    'plan',
+    `Incremental Everything: ${
+      incMode === 'off'
+        ? 'off'
+        : incMode === 'always'
+          ? 'enrol every new source, and any that gains a highlight'
+          : 'enrol a Reader source once it is archived; every other source when created or when it gains a highlight'
+    }.`
+  );
   const ctx: SyncContext = {
     tagList: opts.tagList,
     included: opts.included,
@@ -641,6 +744,7 @@ export async function buildSyncContext(
     orphanDocNames: [],
     existingSources: [],
     sourceByBookId: new Map(),
+    incMode,
     incSetup: undefined,
   };
   await scanExistingSources(plugin, ctx, opts.log);
@@ -724,6 +828,17 @@ const categoryLabelOf = (source: ReadwiseSource): string => {
 /** Reader info for a source (only reader sources have an external_id). */
 const readerInfoOf = (source: ReadwiseSource, ctx: SyncContext): ReaderInfo | undefined =>
   source.external_id ? ctx.readerByExternalId.get(source.external_id) : undefined;
+
+/** Whether the user has finished a source, by its Reader doc id (see `DoneState`). Takes the id rather
+ *  than the source so an existing doc can be judged by its stored `externalId` when Readwise did not
+ *  return it. Same three-way logic as `desiredLocation`, so it always agrees with the Location property. */
+function doneStateOf(externalId: string | null | undefined, ctx: SyncContext): DoneState {
+  const ext = (externalId ?? '').trim();
+  if (!ext) return 'no-signal';
+  const info = ctx.readerByExternalId.get(ext);
+  if (info) return info.location === READER_ARCHIVE ? 'archived' : 'reading';
+  return ctx.readerComplete ? 'no-signal' : 'unknown';
+}
 
 /** Display label for a Reader `location` value; an unknown/empty value → "Not in Reader". */
 const locationLabelOf = (location: string | null | undefined): string =>
@@ -1031,13 +1146,31 @@ async function addHighlight(
 
 // ───────────────────────── Incremental Everything (optional) ─────────────────────────
 
+/**
+ * One of an incremental parent's IE slots as trimmed text, '' when it has none. `getPowerupProperty`
+ * answers UNDEFINED — not '' as its type says — for a slot never set, and the original Incremental
+ * Everything has no `rotation` slot at all. Unguarded, a `Readwise` or `Sources` doc tagged incremental
+ * without a priority made EVERY enrolment fail on `.trim()` of undefined (found live 2026-11-24; the
+ * inheritance had read the slots that way since the first version, 2026-06-21). A failed read falls
+ * back to IE's default like an empty one.
+ */
+async function readIeSlot(rem: PluginRem, slot: string): Promise<string> {
+  try {
+    const v = await rem.getPowerupProperty(IE.powerup, slot);
+    return typeof v === 'string' ? v.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
 async function getIncSetup(plugin: RNPlugin, ctx: SyncContext, log?: SyncLog): Promise<IncSetup | null> {
   if (ctx.incSetup !== undefined) return ctx.incSetup;
   let setup: IncSetup | null = null;
-  if (await plugin.settings.getSetting<boolean>(SETTINGS.initIncremental)) {
-    const pu = await plugin.powerup.getPowerupByCode(IE.powerup);
+  // The mode the PREVIEW was computed under, not a fresh settings read: the apply does what was shown.
+  if (ctx.incMode !== 'off') {
+    const pu = await findPowerup(plugin, IE.powerup);
     if (!pu) {
-      log?.log('apply', 'Incremental Everything not installed — skipped making sources incremental.');
+      log?.log('apply', 'Incremental Everything not installed or not enabled — skipped making sources incremental.');
     } else {
       const sourcesRem = await findSourcesParent(plugin);
       const rootRem = await plugin.rem.findByName([HIERARCHY.root], null);
@@ -1049,9 +1182,9 @@ async function getIncSetup(plugin: RNPlugin, ctx: SyncContext, log?: SyncLog): P
       let priority = String(IE.defaultPriority);
       let rotation: string = IE.defaultRotation;
       if (incParent) {
-        const inherited = (await incParent.getPowerupProperty(IE.powerup, IE.prioritySlot)).trim();
+        const inherited = await readIeSlot(incParent, IE.prioritySlot);
         if (inherited) priority = inherited;
-        const inhRotation = (await incParent.getPowerupProperty(IE.powerup, IE.rotationSlot)).trim();
+        const inhRotation = await readIeSlot(incParent, IE.rotationSlot);
         if (inhRotation && inhRotation.toLowerCase() !== 'default') rotation = inhRotation;
       }
       setup = { pu, incParent, priority, rotation };
@@ -1061,33 +1194,69 @@ async function getIncSetup(plugin: RNPlugin, ctx: SyncContext, log?: SyncLog): P
   return setup;
 }
 
-async function makeIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncContext, log?: SyncLog): Promise<void> {
+/** Why a doc is not (re-)enrolled: it already is incremental, or the user DISMISSED it in IE — "finish
+ *  this item for good" swaps `incremental` for `dismissed` — or the check itself could not be read.
+ *  Undefined = free to enrol. A failed read is never taken as "free": at plan time that would offer a
+ *  doc the user may have dismissed. */
+async function incrementalBlocker(rem: PluginRem): Promise<'incremental' | 'dismissed' | 'unreadable' | undefined> {
   try {
-    if (await rem.hasPowerup(IE.powerup)) return;
-    const setup = await getIncSetup(plugin, ctx, log);
-    if (!setup) return;
-    // Replicate IE's initIncrementalRem writes exactly (verified against the IE source) so the rem is
-    // byte-identical to an IE-native one. nextRepDate = today → due now; originalIncDate + firstAdded
-    // = today too; priority + rotation as single-element string arrays; repHist = the madeIncremental
-    // marker. (firstAdded/rotation aren't required to PARSE as incremental, but IE writes them and its
-    // UI reads them, so we match.)
-    await rem.addPowerup(IE.powerup);
-    const dailyDoc = await plugin.date.getDailyDoc(new Date());
-    const dateRef = dailyDoc ? await plugin.richText.rem(dailyDoc).value() : undefined;
-    if (dateRef) {
-      await rem.setPowerupProperty(IE.powerup, IE.nextRepDateSlot, dateRef);
-      await rem.setPowerupProperty(IE.powerup, IE.originalIncDateSlot, dateRef);
-      await rem.setPowerupProperty(IE.powerup, IE.firstAddedSlot, dateRef);
-    }
-    await rem.setPowerupProperty(IE.powerup, IE.prioritySlot, [setup.priority]);
-    await rem.setPowerupProperty(IE.powerup, IE.rotationSlot, [setup.rotation]);
-    const parsedPriority = Number(setup.priority);
-    const priorityNum = Number.isFinite(parsedPriority) ? parsedPriority : IE.defaultPriority;
-    const marker = { date: Date.now(), scheduled: Date.now(), eventType: 'madeIncremental', priority: priorityNum };
-    await rem.setPowerupProperty(IE.powerup, IE.repHistSlot, [JSON.stringify([marker])]);
-    log?.log('apply', `Made source incremental (priority ${setup.priority}, rotation ${setup.rotation}).`);
+    if (await rem.hasPowerup(IE.powerup)) return 'incremental';
+    if (await rem.hasPowerup(IE.dismissedPowerup)) return 'dismissed';
+    return undefined;
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/**
+ * Enrol ONE doc in Incremental Everything. Returns true when it was enrolled, false when it needs no
+ * enrolment (already incremental, or dismissed in IE — never re-enrolled, see `IE.dismissedPowerup`).
+ * THROWS when it cannot be done, so a `toMakeIncremental` row can be marked failed; the ride-along on
+ * create / add rows goes through `makeIncremental`, which swallows that.
+ */
+async function enrolIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncContext, log?: SyncLog): Promise<boolean> {
+  const blocker = await incrementalBlocker(rem);
+  if (blocker === 'unreadable') throw new Error('could not read whether the doc is already incremental');
+  if (blocker) {
+    if (blocker === 'dismissed') log?.log('apply', '  dismissed in Incremental Everything — not re-enrolled.');
+    return false;
+  }
+  const setup = await getIncSetup(plugin, ctx, log);
+  if (!setup) throw new Error('Incremental Everything is not installed (or making sources incremental is off)');
+  // Replicate IE's initIncrementalRem writes exactly (verified against the IE source) so the rem is
+  // byte-identical to an IE-native one. nextRepDate = today → due now; originalIncDate + firstAdded
+  // = today too; priority + rotation as single-element string arrays; repHist = the madeIncremental
+  // marker. (firstAdded/rotation aren't required to PARSE as incremental, but IE writes them and its
+  // UI reads them, so we match.)
+  await rem.addPowerup(IE.powerup);
+  const dailyDoc = await plugin.date.getDailyDoc(new Date());
+  const dateRef = dailyDoc ? await plugin.richText.rem(dailyDoc).value() : undefined;
+  if (dateRef) {
+    await rem.setPowerupProperty(IE.powerup, IE.nextRepDateSlot, dateRef);
+    await rem.setPowerupProperty(IE.powerup, IE.originalIncDateSlot, dateRef);
+    await rem.setPowerupProperty(IE.powerup, IE.firstAddedSlot, dateRef);
+  }
+  await rem.setPowerupProperty(IE.powerup, IE.prioritySlot, [setup.priority]);
+  await rem.setPowerupProperty(IE.powerup, IE.rotationSlot, [setup.rotation]);
+  const parsedPriority = Number(setup.priority);
+  const priorityNum = Number.isFinite(parsedPriority) ? parsedPriority : IE.defaultPriority;
+  const marker = { date: Date.now(), scheduled: Date.now(), eventType: 'madeIncremental', priority: priorityNum };
+  await rem.setPowerupProperty(IE.powerup, IE.repHistSlot, [JSON.stringify([marker])]);
+  log?.log('apply', `Made source incremental (priority ${setup.priority}, rotation ${setup.rotation}).`);
+  return true;
+}
+
+/** The ride-along form, for a create / add-highlights / add-supplements row: enrolment is secondary to
+ *  what that row does, so a failure is logged and never fails the row. (An archived Reader doc whose
+ *  enrolment failed here is offered its own row by the next sync — it is still archived and still not
+ *  incremental; any other doc is retried the next time it gains a highlight, as it always was.)
+ *  Returns true when it enrolled the doc. */
+async function makeIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncContext, log?: SyncLog): Promise<boolean> {
+  try {
+    return await enrolIncremental(plugin, rem, ctx, log);
   } catch (err) {
     log?.log('apply', `Incremental-init failed (non-fatal): ${errMsg(err)}`);
+    return false;
   }
 }
 
@@ -1495,6 +1664,25 @@ export async function computeSyncPlan(
   const nameForNew = (source: ReadwiseSource, isSupplementDoc: boolean): string =>
     newName.get(source.user_book_id) ??
     displayBase(baseTitleOf(source), (source.author ?? '').trim()) + (isSupplementDoc ? SUPPLEMENT_DOC_SUFFIX : '');
+  // ── Incremental Everything: who is enrolled, decided HERE so the preview shows it ──────────────────
+  // `readerWhenArchived` (the default): a Reader source waits for the archive; a source with NO "done"
+  // signal (not in Reader) keeps the original rule — enrolled on create, or when it gains content; a
+  // Reader source this run could not place (`unknown`) is left for a run that can.
+  /** Whether a doc CREATED this run is enrolled as part of its create. */
+  const enrolOnCreate = (source: ReadwiseSource): boolean => {
+    if (ctx.incMode === 'always') return true;
+    if (ctx.incMode !== 'readerWhenArchived') return false;
+    const state = doneStateOf(source.external_id, ctx);
+    return state === 'archived' || state === 'no-signal';
+  };
+  /** Whether an EXISTING doc gaining highlights/supplements is enrolled once they land (the original
+   *  "earned new content" rule). An archived Reader doc is not enrolled here — it has its own row —
+   *  and a doc already incremental or DISMISSED in IE is never enrolled, so the row's hint is true. */
+  const enrolOnNewContent = async (rem: PluginRem, externalId: string | null | undefined): Promise<boolean> => {
+    const wanted =
+      ctx.incMode === 'always' || (ctx.incMode === 'readerWhenArchived' && doneStateOf(externalId, ctx) === 'no-signal');
+    return wanted && (await incrementalBlocker(rem)) === undefined;
+  };
 
   const toCreateSources: SourceCreateEntry[] = [
     ...creating.map(({ source, eligible, supplements }) => ({
@@ -1506,6 +1694,7 @@ export async function computeSyncPlan(
       eligible,
       supplements,
       isSupplementDoc: false,
+      makeIncremental: enrolOnCreate(source),
     })),
     // Supplement documents: the supplemental's highlights are the document's OWN bullets (the whole
     // document is the supplement), so a later merge can move them straight into the main doc.
@@ -1518,11 +1707,15 @@ export async function computeSyncPlan(
       eligible,
       supplements: [] as ReadwiseHighlight[],
       isSupplementDoc: true,
+      // A supplemental is never in Reader (`no-signal`), so a holding doc is enrolled on create exactly
+      // as it always was — in both enrolling modes.
+      makeIncremental: enrolOnCreate(source),
     })),
   ];
 
   const toUpdateSources: SourceUpdateEntry[] = [];
   const toAddHighlights: SourceAddHighlights[] = [];
+  const toMakeIncremental: IncrementalEntry[] = [];
   const alreadyInSync: KeptEntry[] = [];
   const touchedRemIds = new Set<string>();
 
@@ -1532,8 +1725,29 @@ export async function computeSyncPlan(
     if (changes.length) toUpdateSources.push({ id: `su:${es.rem._id}`, name: es.name, rem: es.rem, source, changes });
     const newHls = eligible.filter((h) => !es.ledger.has(String(h.id)));
     if (newHls.length)
-      toAddHighlights.push({ id: `ha:${es.rem._id}`, sourceRemId: es.rem._id, name: es.name, rem: es.rem, highlights: newHls });
-    if (!changes.length && !newHls.length && !supplementsByRemId.has(es.rem._id))
+      toAddHighlights.push({
+        id: `ha:${es.rem._id}`,
+        sourceRemId: es.rem._id,
+        name: es.name,
+        rem: es.rem,
+        highlights: newHls,
+        makeIncremental: await enrolOnNewContent(es.rem, source.external_id),
+      });
+    // Done = archived in Reader. STATE-driven, not a one-off event: every archived doc that is neither
+    // incremental nor dismissed in IE is offered, so a row the user unticks — or an enrolment that
+    // failed — comes back next run like any other row, and a doc archived while the option was off is
+    // still picked up. The `dismissed` check is what keeps a doc the user finished in IE from coming
+    // back. Only docs Readwise returned and the filters let through are considered — an excluded or
+    // Readwise-deleted source is not this sync's business (its Location still updates, below).
+    let enrol = false;
+    if (ctx.incMode === 'readerWhenArchived' && doneStateOf(source.external_id, ctx) === 'archived') {
+      const blocker = await incrementalBlocker(es.rem);
+      if (blocker === 'unreadable')
+        log?.log('plan', `  could not read whether "${es.name}" is already incremental — not offered this run.`);
+      enrol = blocker === undefined;
+      if (enrol) toMakeIncremental.push({ id: `mi:${es.rem._id}`, name: es.name, rem: es.rem });
+    }
+    if (!changes.length && !newHls.length && !supplementsByRemId.has(es.rem._id) && !enrol)
       alreadyInSync.push({ id: `k:${es.rem._id}`, name: es.name });
     await yieldToHost(); // the repair pass added slot reads per source; keep the iframe breathing
   }
@@ -1541,14 +1755,28 @@ export async function computeSyncPlan(
   // A supplement document still waiting for its main source gains its new highlights as ordinary
   // bullets (it is never in `existingTouched`, so these ids can't clash).
   for (const { es, highlights } of supplementDocAdds.values())
-    toAddHighlights.push({ id: `ha:${es.rem._id}`, sourceRemId: es.rem._id, name: es.name, rem: es.rem, highlights });
+    toAddHighlights.push({
+      id: `ha:${es.rem._id}`,
+      sourceRemId: es.rem._id,
+      name: es.name,
+      rem: es.rem,
+      highlights,
+      makeIncremental: await enrolOnNewContent(es.rem, es.externalId),
+    });
 
-  const toAddSupplements: SupplementAddEntry[] = [...supplementsByRemId.values()].map(({ es, highlights }) => ({
-    id: `hs:${es.rem._id}`,
-    name: es.name,
-    rem: es.rem,
-    highlights,
-  }));
+  const toAddSupplements: SupplementAddEntry[] = [];
+  for (const { es, highlights } of supplementsByRemId.values()) {
+    // The MAIN doc's own source decides: what Readwise returned for it this run (a null `external_id`
+    // there is an answer too — not in Reader), else the id stored on the doc.
+    const fetched = fetchedByRem.get(es.rem._id);
+    toAddSupplements.push({
+      id: `hs:${es.rem._id}`,
+      name: es.name,
+      rem: es.rem,
+      highlights,
+      makeIncremental: await enrolOnNewContent(es.rem, fetched ? fetched.external_id : es.externalId),
+    });
+  }
 
   // Existing docs NOT touched above (absent from the fetch, category-excluded, or deleted on the
   // Readwise side) can still need two Readwise-independent updates: a symmetric RENAME (this is also
@@ -1579,6 +1807,9 @@ export async function computeSyncPlan(
       `${toAddHighlights.reduce((n, g) => n + g.highlights.length, 0)} highlight(s) to add, ` +
       `${toAddSupplements.reduce((n, g) => n + g.highlights.length, 0)} supplement(s) to add, ` +
       `${toMergeSupplementDocs.length} supplement doc(s) to merge, ${toFoldLookupDuplicates.length} duplicate lookup rem(s), ` +
+      `${toMakeIncremental.length} archived doc(s) to make incremental ` +
+      `(+${toCreateSources.filter((e) => e.makeIncremental).length} on create, ` +
+      `+${new Set([...toAddHighlights, ...toAddSupplements].filter((e) => e.makeIncremental).map((e) => e.rem._id)).size} with new content), ` +
       `${alreadyInSync.length} in sync.`
   );
   return {
@@ -1588,6 +1819,8 @@ export async function computeSyncPlan(
     toAddSupplements,
     toMergeSupplementDocs,
     toFoldLookupDuplicates,
+    toMakeIncremental,
+    incMode: ctx.incMode,
     alreadyInSync,
     fetchedSources: sources.length,
     matchingHighlights,
@@ -1606,6 +1839,7 @@ export interface ApplySelection {
   toAddSupplements: { entry: SupplementAddEntry; highlightIds: Set<number> }[];
   toMergeSupplementDocs: SupplementMerge[];
   toFoldLookupDuplicates: LookupDuplicate[];
+  toMakeIncremental: IncrementalEntry[];
 }
 
 export interface ApplyCallbacks {
@@ -1658,7 +1892,8 @@ async function applyUpdate(
 }
 
 /** Create one source doc + its eligible highlights; ledger holds only the highlights that succeeded.
- *  Returns the number of highlights that FAILED (left out of the ledger → re-staged next run).
+ *  Returns the number of highlights that FAILED (left out of the ledger → re-staged next run) and
+ *  whether the doc was enrolled in Incremental Everything (only when `entry.makeIncremental`).
  *  Order matters: the doc is parented under Sources/ and given its IDENTITY (powerup + userBookId)
  *  before anything else, so a failure part-way leaves a doc the next scan recognises — never a
  *  same-titled duplicate. On any failure the half-built doc is ROLLED BACK (removed; best effort — it
@@ -1673,7 +1908,7 @@ async function createSourceDoc(
   powerupRem: PluginRem,
   syncedAt: number,
   log?: SyncLog
-): Promise<number> {
+): Promise<{ hlFailed: number; enrolled: boolean }> {
   const s = entry.source;
   const rem = await plugin.rem.createRem();
   if (!rem) throw new Error('createRem returned undefined for a source');
@@ -1767,8 +2002,11 @@ async function createSourceDoc(
     }
     await writeLedger(rem, added, log);
     await setProp(rem, SOURCE_SLOTS.lastSyncedAt, [String(syncedAt)]);
-    await makeIncremental(plugin, rem, ctx, log);
-    return hlFailed;
+    // Decided at plan time (and shown on the row): every create in `always` mode; in
+    // `readerWhenArchived` mode all but a Reader source still being read (or one the sweep missed).
+    // Never throws — the doc is complete either way.
+    const enrolled = entry.makeIncremental ? await makeIncremental(plugin, rem, ctx, log) : false;
+    return { hlFailed, enrolled };
   } catch (err) {
     try {
       // remove() DOES cascade inside the manifest's delete scope — verified 2026-09-05 by removing a
@@ -1890,10 +2128,12 @@ async function applyAddSupplements(
 }
 
 /**
- * Apply the selection. Order: update sources → add highlights → add supplements → create sources. Aborts up-front (zero
- * changes) if the powerup isn't registered (plugin not reloaded). Per-row `onItemDone` for progress.
- * `failed` counts ROWS that threw; `highlightsFailed` counts individual highlights that failed inside
- * an otherwise-successful row (left out of the ledger, so the next sync re-stages them).
+ * Apply the selection. Order: fold duplicate lookup rems → update sources → add highlights → add
+ * supplements → create sources → merge supplement docs → make archived docs incremental. Aborts
+ * up-front (zero changes) if the powerup isn't registered (plugin not reloaded). Per-row `onItemDone`
+ * for progress. `failed` counts ROWS that threw; `highlightsFailed` counts individual highlights that
+ * failed inside an otherwise-successful row (left out of the ledger, so the next sync re-stages them);
+ * `madeIncremental` counts every doc enrolled in Incremental Everything, ride-alongs included.
  */
 export async function applySyncPlan(
   plugin: RNPlugin,
@@ -1911,10 +2151,12 @@ export async function applySyncPlan(
   mergedDocs: number;
   /** Duplicate lookup rems folded into their canonical twin (and deleted). */
   foldedLookups: number;
+  /** Docs enrolled in Incremental Everything: `toMakeIncremental` rows plus create/add ride-alongs. */
+  madeIncremental: number;
   failed: number;
 }> {
   const onItemDone = callbacks.onItemDone ?? (() => {});
-  const powerupRem = await plugin.powerup.getPowerupByCode(SOURCE_POWERUP);
+  const powerupRem = await findPowerup(plugin, SOURCE_POWERUP);
   if (!powerupRem) {
     const msg =
       'Readwise Source powerup is not registered — reload the plugin (toggle it off/on in Settings → ' +
@@ -1932,6 +2174,7 @@ export async function applySyncPlan(
   let mergedDocs = 0;
   let merged = 0;
   let foldedLookups = 0;
+  let madeIncremental = 0;
   let failed = 0;
 
   log?.section('Apply');
@@ -1976,10 +2219,11 @@ export async function applySyncPlan(
       const { added, failed: hlFailed } = await applyAddHighlights(plugin, entry.rem, picked, syncedAt, ctx.applyColors, log);
       highlightsAdded += added;
       highlightsFailed += hlFailed;
-      // An existing source that just gained ≥1 highlight and isn't yet incremental gets enrolled too —
-      // same opt-in setting as on create. makeIncremental is idempotent (skips if already tagged) and
-      // no-ops when the setting is off / IE isn't installed, and never throws.
-      if (added > 0) await makeIncremental(plugin, entry.rem, ctx, log);
+      // The original "earned new content" rule, decided at plan time (`entry.makeIncremental`): an
+      // existing source that just gained ≥1 highlight gets enrolled — every one in `always` mode, only
+      // one with no "done" signal in `readerWhenArchived` mode. makeIncremental re-checks for a doc
+      // already incremental or dismissed, and never throws.
+      if (added > 0 && entry.makeIncremental && (await makeIncremental(plugin, entry.rem, ctx, log))) madeIncremental += 1;
       onItemDone(entry.id, true);
     } catch (err) {
       failed += 1;
@@ -1996,7 +2240,7 @@ export async function applySyncPlan(
       supplementsAdded += added;
       highlightsFailed += hlFailed;
       // Same enrolment rule as own-highlights: a source that just earned content gets enrolled.
-      if (added > 0) await makeIncremental(plugin, entry.rem, ctx, log);
+      if (added > 0 && entry.makeIncremental && (await makeIncremental(plugin, entry.rem, ctx, log))) madeIncremental += 1;
       onItemDone(entry.id, true);
     } catch (err) {
       failed += 1;
@@ -2010,7 +2254,9 @@ export async function applySyncPlan(
     const parent = await ensureSourcesParent(plugin);
     for (const entry of selection.toCreateSources) {
       try {
-        highlightsFailed += await createSourceDoc(plugin, ctx, entry, parent, powerupRem, syncedAt, log);
+        const r = await createSourceDoc(plugin, ctx, entry, parent, powerupRem, syncedAt, log);
+        highlightsFailed += r.hlFailed;
+        if (r.enrolled) madeIncremental += 1;
         created += 1;
         onItemDone(entry.id, true);
       } catch (err) {
@@ -2037,13 +2283,29 @@ export async function applySyncPlan(
     await yieldToHost();
   }
 
+  // Enrol archived docs LAST, once every row above has finished writing them: a doc enters the
+  // Incremental Everything queue complete, with this run's highlights and its new Location. `?? []`
+  // keeps a caller that predates this field (the test suite's selection builders) working.
+  for (const entry of selection.toMakeIncremental ?? []) {
+    try {
+      log?.log('apply', `Making "${entry.name}" incremental (archived in Reader).`);
+      if (await enrolIncremental(plugin, entry.rem, ctx, log)) madeIncremental += 1;
+      onItemDone(entry.id, true);
+    } catch (err) {
+      failed += 1;
+      log?.log('apply', `MAKE-INCREMENTAL FAILED for ${entry.name}: ${errMsg(err)}`);
+      onItemDone(entry.id, false);
+    }
+    await yieldToHost();
+  }
+
   log?.log(
     'apply',
     `Done: ${created} created, ${updated} updated, ${highlightsAdded} highlights + ${supplementsAdded} supplement(s) added ` +
       `(${highlightsFailed} failed), ${mergedDocs} supplement doc(s) merged (${merged} bullet(s) moved), ` +
-      `${foldedLookups} duplicate lookup rem(s) folded, ${failed} row(s) failed.`
+      `${foldedLookups} duplicate lookup rem(s) folded, ${madeIncremental} made incremental, ${failed} row(s) failed.`
   );
-  return { created, updated, highlightsAdded, supplementsAdded, highlightsFailed, mergedDocs, foldedLookups, failed };
+  return { created, updated, highlightsAdded, supplementsAdded, highlightsFailed, mergedDocs, foldedLookups, madeIncremental, failed };
 }
 
 // ───────────────────────── Supplement documents: fold one into its main document ──

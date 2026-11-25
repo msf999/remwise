@@ -19,7 +19,7 @@ as properties, with its highlights as bullets beneath it.
 > matching highlights and keeps each source's own metadata in step. Readwise-side highlight edits and
 > deletes do **not** propagate, and nothing of yours in Remnote is ever removed. The only deletions are
 > Remwise's own: housekeeping you can untick in the preview (an emptied supplement document once its
-> highlights have moved into the book, or a duplicate Author / Category / Location entry), and its own
+> highlights have moved into the book, or a duplicate Author / Category / Location / Date entry), and its own
 > half-finished work when a write fails (a document it was still creating, or a highlight bullet it had
 > only half written).
 
@@ -92,7 +92,7 @@ The **Sync Readwise** popup never changes anything until you say so. **Get from 
 library and shows the plan grouped into collapsible, selectable categories — *Will create (sources)*
 (grouped by category), *Will update source*, *Will add highlights*, *Will add supplements*, *Will make
 Incremental*, *Will merge supplement documents into their source*, *Will fold
-duplicate Author / Category / Location rems*, and read-only *Already in sync* — each shown only when it
+duplicate Author / Category / Location / Date rems*, and read-only *Already in sync* — each shown only when it
 has something in it, with per-row and select-all checkboxes, a live fetch progress bar, then per-item
 ✅/❌ and a completion toast. A collapsible **Log** box (with a copy button) shows the full diagnostic
 log.
@@ -120,13 +120,17 @@ Readwise/
 ├─ Authors/               — one rem per author
 │  ├─ James Clear
 │  └─ …
-└─ Locations/             — the Reader location each source lives in
-   ├─ Inbox
-   ├─ Later
-   ├─ Shortlist
-   ├─ Archive
-   ├─ Feed
-   └─ Not in Reader       ← sources that aren't Reader documents
+├─ Locations/             — the Reader location each source lives in
+│  ├─ Inbox
+│  ├─ Later
+│  ├─ Shortlist
+│  ├─ Archive
+│  ├─ Feed
+│  └─ Not in Reader       ← sources that aren't Reader documents
+└─ Dates/                 — the day of each source's first highlight, as a tree
+   └─ 2024
+      └─ 05
+         └─ 17
 ```
 
 **Each source document** is tagged the **`Readwise Source`** powerup and carries its metadata as
@@ -136,6 +140,7 @@ properties at the top of the document:
 | --- | --- |
 | **Author** | → reference into `Readwise/Authors` |
 | **Category** | → reference into `Readwise/Categories` (Books / Articles / Tweets / Podcasts / Supplementals) |
+| **Date** | the day of the source's FIRST highlight, as a path of three references into `Readwise/Dates` (‹2024›-‹05›-‹17›): click the year, month or day to see every source from it. Set once; a source with no dated highlight has none |
 | **Location** | → reference into `Readwise/Locations` — the Reader location (Inbox / Later / Shortlist / Archive / Feed), or _Not in Reader_. (Left blank if the Reader sweep couldn't finish that run — the popup warns you, and the next sync that reaches the document fills it in — and, with Incremental Everything enrolment on, until a new document's enrolment has worked.) |
 | **Link** | the source's URL, as a clickable link |
 | **Readwise** | a link to the source on Readwise |
@@ -180,6 +185,7 @@ by that author.
 | **Readwise access token** | — | Your token from [readwise.io/access_token](https://readwise.io/access_token). A read-only token is fine. **Required.** |
 | **Tags to copy (comma-separated)** | _(empty)_ | Copy highlights carrying one of these tags (case-insensitive); if a SOURCE itself carries the tag, ALL of its highlights are copied. Empty = copy every highlight. Tip: start with a single tag (e.g. `science`) to see how it looks. |
 | **Apply highlight colors** | Off | On = each highlight's Readwise color (yellow / blue / pink / orange / green / purple) is applied as a Remnote highlight color. Off = highlights import as plain text. |
+| **Show each highlight's location** | Off | On = each NEW highlight ends with where it sits in its source: "p. 42" for a page, "loc. 1234" for a Kindle location, "12:34" for a podcast or video (sources that give no such place get nothing). Highlights already in Remnote are never edited, so they stay as they are. |
 | **Include Books / Articles / Tweets / Podcasts / Supplementals** | On (each) | Five toggles — include each Readwise category when syncing. Turn all five off and nothing syncs (the popup tells you so). *Supplementals* adds curated popular highlights to the **Supplements** section of the matching source, not a document of its own. |
 | **Make source docs Incremental** | Off | Enrol source documents into [Incremental Everything](https://github.com/bjsi/incremental-everything) (due today) — by default once per document, when it is first synced or (a Reader source you are still reading) when you archive it; see the next setting. A document you dismissed there is never enrolled again, and a *- Supplement* document never is. Requires that plugin running (otherwise nothing is enrolled, and the preview warns you). Reload Incremental Everything (or Remnote) after a sync for enrolled docs to enter the queue. |
 | **…Reader sources only once archived (done)** | On | On = each source is enrolled once: a Readwise Reader source when you have archived it there (at its first sync if it already is, else at the first sync after you archive it — listed under *Will make Incremental* in the preview); every other source, which has no "done" signal, at its first sync. A document taken out of Incremental Everything is not put back unless a sync sees it out of the Archive and you then archive it again, and a document synced while the option was off is enrolled only if a later sync sees it move into the Archive. Off = the original rule: every source when it is created, and again whenever it gains a new highlight. |

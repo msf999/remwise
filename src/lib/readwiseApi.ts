@@ -109,8 +109,10 @@ interface GetOpts {
 
 /**
  * GET a URL with the Readwise auth header, honoring 429 `Retry-After` (in SECONDS — multiply by 1000)
- * by sleeping then re-issuing the SAME request, capped at `MAX_RETRIES`. 401 → toasted + thrown; other
- * non-OK → toasted + thrown (unless `toast:false`). Returns the parsed JSON.
+ * by sleeping then re-issuing the SAME request, capped at `MAX_RETRIES`. A 502/503/504 — a passing
+ * hiccup on Readwise's side — is retried the same way (since 2026-11-25, REMINDERS.md R-017; it used to
+ * fail the whole export, or cut the Reader sweep short). 401 → toasted + thrown; other non-OK (a 500
+ * included: not a known-transient error) → toasted + thrown (unless `toast:false`). Returns the JSON.
  */
 async function getJson<T>(
   plugin: RNPlugin,
@@ -124,12 +126,16 @@ async function getJson<T>(
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, { headers: { Authorization: `Token ${token}` }, signal });
     if (res.ok) return (await res.json()) as T;
-    if (res.status === 429 && attempt < MAX_RETRIES) {
+    const serverHiccup = res.status === 502 || res.status === 503 || res.status === 504;
+    if ((res.status === 429 || serverHiccup) && attempt < MAX_RETRIES) {
       const retryAfter = Number.parseInt(res.headers.get('Retry-After') ?? '', 10);
       // Browsers usually hide Retry-After (CORS), so fall back to a growing backoff that can outlast
-      // the API's rolling 1-minute window.
+      // the API's rolling 1-minute window (and most of a server restart).
       const waitMs = (Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : (attempt + 1) * 8) * 1000;
-      log?.log(scope, `Rate limited (429); retry ${attempt + 1}/${MAX_RETRIES} after ${waitMs}ms.`);
+      log?.log(
+        scope,
+        `${serverHiccup ? `Readwise server error (HTTP ${res.status})` : 'Rate limited (429)'}; retry ${attempt + 1}/${MAX_RETRIES} after ${waitMs}ms.`
+      );
       await sleep(waitMs, signal);
       continue;
     }
@@ -138,7 +144,9 @@ async function getJson<T>(
         ? 'Readwise rejected the token (HTTP 401). Check it in the plugin settings.'
         : res.status === 429
           ? 'Readwise is rate-limiting requests (HTTP 429, retries exhausted) — wait a minute, then try again.'
-          : `Readwise request failed: HTTP ${res.status} ${res.statusText}.`;
+          : serverHiccup
+            ? `Readwise's servers are having trouble (HTTP ${res.status}, retries exhausted) — try again in a few minutes.`
+            : `Readwise request failed: HTTP ${res.status} ${res.statusText}.`;
     log?.log(scope, `ERROR: ${msg}`);
     if (!toast) throw new Error(msg);
     await plugin.app.toast(msg);
@@ -208,19 +216,31 @@ export interface ReaderFetchResult {
   error?: string;
 }
 
+/** Reader's TOP-LEVEL document categories. Reader also lists every highlight and note as a Document
+ *  (categories `highlight` and `note`, with a `parent_id`); the location sweep needs only the documents. */
+const READER_DOC_CATEGORIES = ['article', 'email', 'rss', 'pdf', 'epub', 'tweet', 'video'] as const;
+/** Sweeping the categories one by one costs at least one request each, empty or not, so it pays only
+ *  when it skips more pages of highlights and notes than that; below this many, one plain sweep. */
+const READER_SPLIT_MIN_CHILDREN = 100 * READER_DOC_CATEGORIES.length;
+
 /**
  * Fetch ALL Reader (v3) documents and return a `Reader doc id → { location, url, sourceUrl }` map.
- * Same auth + same 429 backoff as v2. The Reader API is 20 req/min, so we pace pages ~1 per 3.2s —
- * a full sweep of a large library takes a while. Best-effort: a failure logs, does NOT toast, and
- * returns whatever was collected flagged `complete:false` (location is enrichment, not core data) —
- * the popup shows a warning and the plan leaves unmapped sources' locations untouched. An abort
- * (popup closed) is re-thrown so the whole preview stops.
+ * Same auth + same 429 backoff as v2. The Reader API is 20 req/min, so requests are paced ~1 per 3.2s —
+ * a full sweep of a large library takes a while. Reader lists every highlight and note as a Document
+ * too, so since 2026-11-25 (review finding 10; REMINDERS.md R-009) three one-document requests first
+ * count everything, highlights and notes: with many of those, the sweep goes category by category over
+ * the top-level documents only — still a FULL sweep, never a stored cursor — and the totals must add up
+ * (a category Reader adds later would otherwise read as "Not in Reader"). Best-effort: a failure logs,
+ * does NOT toast, and returns whatever was collected flagged `complete:false` (location is enrichment,
+ * not core data) — the popup shows a warning and the plan leaves unmapped sources' locations untouched.
+ * An abort (popup closed) is re-thrown so the whole preview stops. `pageDelayMs` exists for the tests.
  */
 export async function fetchReaderDocs(
   plugin: RNPlugin,
-  opts: { onProgress?: (count: number) => void; log?: SyncLog; signal?: AbortSignal }
+  opts: { onProgress?: (count: number) => void; log?: SyncLog; signal?: AbortSignal; pageDelayMs?: number }
 ): Promise<ReaderFetchResult> {
   const { onProgress, log, signal } = opts;
+  const pageDelayMs = opts.pageDelayMs ?? READER_PAGE_DELAY_MS;
   const docs = new Map<string, ReaderInfo>();
   log?.section('Fetch from Readwise Reader (v3 list)');
   const token = (await plugin.settings.getSetting<string>(SETTINGS.apiKey))?.trim();
@@ -228,30 +248,56 @@ export async function fetchReaderDocs(
     log?.log('fetch', 'Reader fetch skipped: no token set.');
     return { docs, complete: false, error: 'no token set' };
   }
-  let cursor: string | null = null;
-  let page = 0;
-  try {
-    while (true) {
-      const params = new URLSearchParams();
-      params.append('limit', '100');
-      if (cursor) params.append('pageCursor', cursor);
+  let requests = 0;
+  /** One LIST request; every request after the first waits `pageDelayMs` (the 20 req/min limit). */
+  const list = async (params: Record<string, string>): Promise<ReaderListPage> => {
+    if (requests > 0) await sleep(pageDelayMs, signal);
+    requests += 1;
+    return getJson<ReaderListPage>(plugin, `${V3_LIST}?${new URLSearchParams(params).toString()}`, token, 'fetch', log, {
+      signal,
+      toast: false,
+    });
+  };
+  /** Page through one LIST query, adding every result to `docs`. Returns the query's reported `count`. */
+  const sweep = async (label: string, filter: Record<string, string>): Promise<number> => {
+    let cursor: string | null = null;
+    let count = 0;
+    let page = 0;
+    do {
+      const data: ReaderListPage = await list({ ...filter, limit: '100', ...(cursor ? { pageCursor: cursor } : {}) });
+      if (page === 0) count = data.count ?? 0;
       page += 1;
-      const data = await getJson<ReaderListPage>(
-        plugin,
-        `${V3_LIST}?${params.toString()}`,
-        token,
-        'fetch',
-        log,
-        { signal, toast: false }
-      );
       for (const d of data.results ?? []) {
         if (d.id) docs.set(d.id, { location: d.location, url: d.url, sourceUrl: d.source_url });
       }
       onProgress?.(docs.size);
-      log?.log('fetch', `Reader page ${page}: +${data.results?.length ?? 0} docs (total ${docs.size}).`);
+      log?.log('fetch', `Reader ${label}page ${page}: +${data.results?.length ?? 0} docs (total ${docs.size}).`);
       cursor = data.nextPageCursor ?? null;
-      if (!cursor) break;
-      await sleep(READER_PAGE_DELAY_MS, signal); // throttle: stay under the 20 req/min Reader limit
+    } while (cursor);
+    return count;
+  };
+  try {
+    const countOf = async (filter: Record<string, string>): Promise<number> => (await list({ ...filter, limit: '1' })).count ?? 0;
+    const total = await countOf({});
+    const children = (await countOf({ category: 'highlight' })) + (await countOf({ category: 'note' }));
+    if (children < READER_SPLIT_MIN_CHILDREN) {
+      log?.log('fetch', `Reader holds ${total} document(s), ${children} of them highlights or notes: one plain sweep.`);
+      await sweep('', {});
+    } else {
+      log?.log(
+        'fetch',
+        `Reader holds ${total} document(s), ${children} of them highlights or notes: sweeping the ${READER_DOC_CATEGORIES.length} document categories only.`
+      );
+      let swept = 0;
+      for (const category of READER_DOC_CATEGORIES) swept += await sweep(`${category} `, { category });
+      // A category Reader adds later is missing from the map, and a COMPLETE sweep would read its
+      // documents as "Not in Reader" — so the totals must add up, or this run counts as incomplete.
+      const unknown = total - children - swept;
+      if (unknown > 0) {
+        const msg = `Reader reports ${unknown} document(s) outside the categories Remwise sweeps`;
+        log?.log('fetch', `${msg} — locations of unmapped sources are left unchanged this run.`);
+        return { docs, complete: false, error: msg };
+      }
     }
   } catch (err) {
     if (isAbortError(err)) throw err; // the popup closed — stop the whole preview, not just this sweep
@@ -263,7 +309,7 @@ export async function fetchReaderDocs(
     );
     return { docs, complete: false, error: msg };
   }
-  log?.log('fetch', `Reader docs mapped: ${docs.size} (complete).`);
+  log?.log('fetch', `Reader docs mapped: ${docs.size} in ${requests} request(s) (complete).`);
   return { docs, complete: true };
 }
 
@@ -326,4 +372,45 @@ export function matchesCategoryFilter(source: ReadwiseSource, included: Set<Cate
 /** Readwise highlight color → RemNote highlight-color format token, or undefined (plain). */
 export function colorFormat(color: string | null | undefined): string | undefined {
   return COLOR_MAP[(color ?? '').trim().toLowerCase()];
+}
+
+/**
+ * Where a highlight sits in its source, for the "Show each highlight's location" setting: "p. 42" (a
+ * page), "loc. 1234" (a Kindle location) or "12:34" / "1:02:03" (`time_offset`: seconds into a podcast
+ * or video). Readwise's other location types — `order` (just the sequence), `offset` (a character
+ * position in an article) and `none` — tell a reader nothing, so they give ''.
+ */
+export function highlightLocationLabel(h: Pick<ReadwiseHighlight, 'location' | 'location_type'>): string {
+  const n = Number(h.location);
+  if (h.location === null || h.location === undefined || !Number.isFinite(n)) return '';
+  const type = (h.location_type ?? '').trim().toLowerCase();
+  if (type === 'page' && n >= 1) return `p. ${n}`;
+  if (type === 'location' && n >= 1) return `loc. ${n}`;
+  if (type === 'time_offset' && n >= 0) {
+    const s = Math.floor(n);
+    const two = (x: number): string => String(x).padStart(2, '0');
+    const hours = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    return hours ? `${hours}:${two(mins)}:${two(s % 60)}` : `${mins}:${two(s % 60)}`;
+  }
+  return '';
+}
+
+/**
+ * The day of a source's FIRST highlight (mo's pick, 2026-11-25; REMINDERS.md R-010) as [YYYY, MM, DD]:
+ * the earliest `highlighted_at` among all its highlights that aren't deleted — the tag filter doesn't
+ * matter here, the source's own history does — each falling back to its `created_at`. The day is the
+ * browser's LOCAL day ("the day you highlighted it"); [] when no highlight carries a date.
+ */
+export function firstHighlightDateParts(source: Pick<ReadwiseSource, 'highlights'>): string[] {
+  let first: number | undefined;
+  for (const h of source.highlights ?? []) {
+    if (h.is_deleted) continue;
+    const t = Date.parse((h.highlighted_at ?? '').trim() || (h.created_at ?? '').trim());
+    if (Number.isFinite(t) && (first === undefined || t < first)) first = t;
+  }
+  if (first === undefined) return [];
+  const d = new Date(first);
+  const two = (x: number): string => String(x).padStart(2, '0');
+  return [String(d.getFullYear()), two(d.getMonth() + 1), two(d.getDate())];
 }

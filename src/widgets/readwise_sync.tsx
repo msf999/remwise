@@ -276,7 +276,7 @@ export const ReadwiseSync = () => {
       const warnings: string[] = [];
       if (!reader.complete)
         warnings.push(
-          `Reader location sweep stopped early (${reader.error ?? 'unknown error'}) after mapping ${reader.docs.size} docs — ` +
+          `Reader locations are incomplete this run (${reader.error ?? 'unknown error'}; ${reader.docs.size} docs mapped) — ` +
             'unmapped sources keep their current location and link. A source created NOW gets its location and link ' +
             'filled in by a later complete run, but NOT its Reader URL — consider refreshing before applying creates.'
         );
@@ -764,7 +764,7 @@ export const ReadwiseSync = () => {
             </Section>
 
             <Section
-              title="Will fold duplicate Author / Category / Location rems"
+              title="Will fold duplicate Author / Category / Location / Date rems"
               count={plan.toFoldLookupDuplicates.length}
               {...sectionProps('dup', dupLeafIds)}
             >

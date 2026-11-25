@@ -20,7 +20,14 @@ import {
   SUPPLEMENTS_HEADER,
   type UpdatableField,
 } from './consts';
-import { colorFormat, matchesCategoryFilter, matchesTagFilter, sourceMatchesTagFilter } from './readwiseApi';
+import {
+  colorFormat,
+  firstHighlightDateParts,
+  highlightLocationLabel,
+  matchesCategoryFilter,
+  matchesTagFilter,
+  sourceMatchesTagFilter,
+} from './readwiseApi';
 import type { SyncLog } from './log';
 import type { ReaderInfo, ReadwiseHighlight, ReadwiseSource } from './types/readwise';
 
@@ -292,6 +299,8 @@ export interface SyncContext {
   included: Set<Category>;
   /** When true, apply each highlight's Readwise color as a RemNote highlight color. */
   applyColors: boolean;
+  /** When true, a NEW highlight ends with where it sits in its source (`highlightLocationLabel`). */
+  showLocation: boolean;
   /** Reader doc id → { location, url, sourceUrl }; joined to v2 books by `external_id`. */
   readerByExternalId: Map<string, ReaderInfo>;
   /** True when the Reader sweep fetched EVERY page this run. When false (it failed mid-way), a reader
@@ -542,15 +551,16 @@ async function refValue(plugin: RNPlugin, rem: PluginRem): Promise<RichTextInter
 // ───────────────────────── Cross-device dedup (lookup rems) ─────────────────────────
 
 /**
- * A group of same-name duplicate lookup rems (Categories/Authors/Locations) that a cross-device sync
+ * A group of same-name duplicate lookup rems (Categories/Authors/Locations/Dates) that a cross-device sync
  * race created. Folding one is DESTRUCTIVE — it moves the duplicate's children (which may be the user's
  * own notes), rewrites every rem in the knowledge base that references it, and deletes it — so it is a
  * previewable, tickable plan row like everything else, never an unconditional sweep.
  */
 export interface LookupDuplicate {
   id: string; // `ld:<duplicate remId>`
-  /** Which lookup document it sits under (Categories / Authors / Locations). */
+  /** Which lookup document it sits under (Categories / Authors / Locations / Dates). */
   docName: string;
+  /** Its name — for the nested Dates tree, its whole path ("2024-05"), since "05" alone is ambiguous. */
   name: string;
   canonical: PluginRem;
   duplicate: PluginRem;
@@ -561,41 +571,44 @@ export interface LookupDuplicate {
 }
 
 /**
- * Find same-name duplicate lookup rems under `Readwise/{Categories,Authors,Locations}`. READ-ONLY —
- * it only reports what folding WOULD do (the oldest copy is kept). `rem.merge` is not used: it leaves
- * references dangling.
+ * Find same-name duplicate lookup rems under `Readwise/{Categories,Authors,Locations,Dates}`. READ-ONLY
+ * — it only reports what folding WOULD do (the oldest copy is kept). `rem.merge` is not used: it leaves
+ * references dangling. The Dates tree is searched level by level under each KEPT copy (as Remzot folds
+ * its Dates); a fold that brings two same-named months together is found by the next sync.
  */
 async function findLookupDuplicates(plugin: RNPlugin, log?: SyncLog): Promise<LookupDuplicate[]> {
   const out: LookupDuplicate[] = [];
   const root = await plugin.rem.findByName([HIERARCHY.root], null);
   if (!root) return out;
 
-  for (const docName of [HIERARCHY.categories, HIERARCHY.authors, HIERARCHY.locations]) {
-    const doc = await plugin.rem.findByName([docName], root._id);
-    if (!doc) continue;
+  const scan = async (parent: PluginRem, docName: string, path: string[], nested: boolean): Promise<void> => {
     const groups = new Map<string, PluginRem[]>();
-    for (const child of await doc.getChildrenRem()) {
+    for (const child of await parent.getChildrenRem()) {
       if (await isStructuralRem(child)) continue;
       const name = (await remName(plugin, child)).trim();
       if (!name) continue;
       (groups.get(name) ?? groups.set(name, []).get(name)!).push(child);
     }
     for (const [name, rems] of groups) {
-      if (rems.length < 2) continue;
       rems.sort((a, b) => a.createdAt - b.createdAt);
       for (let i = 1; i < rems.length; i++) {
         const duplicate = rems[i];
         out.push({
           id: `ld:${duplicate._id}`,
           docName,
-          name,
+          name: [...path, name].join('-'),
           canonical: rems[0],
           duplicate,
           childCount: (await movableChildren(duplicate)).length,
           referenceCount: (await duplicate.remsReferencingThis()).length,
         });
       }
+      if (nested) await scan(rems[0], docName, [...path, name], true);
     }
+  };
+  for (const docName of [HIERARCHY.categories, HIERARCHY.authors, HIERARCHY.locations, HIERARCHY.dates]) {
+    const doc = await plugin.rem.findByName([docName], root._id);
+    if (doc) await scan(doc, docName, [], docName === HIERARCHY.dates);
   }
   if (out.length) log?.log('plan', `Found ${out.length} duplicate lookup rem(s) that could be folded into the oldest copy.`);
   return out;
@@ -832,6 +845,7 @@ export async function buildSyncContext(
     throw new Error(msg);
   }
   const applyColors = (await plugin.settings.getSetting<boolean>(SETTINGS.applyColors)) ?? false;
+  const showLocation = (await plugin.settings.getSetting<boolean>(SETTINGS.showLocation)) ?? false;
   const modes = opts.incMode
     ? { wanted: opts.incWanted ?? opts.incMode, mode: opts.incMode }
     : await readIncrementalMode(plugin, opts.log);
@@ -852,6 +866,7 @@ export async function buildSyncContext(
     tagList: opts.tagList,
     included: opts.included,
     applyColors,
+    showLocation,
     readerByExternalId: opts.readerByExternalId,
     readerComplete: opts.readerComplete,
     lookupCache: new Map(),
@@ -1105,6 +1120,51 @@ async function writeCategory(plugin: RNPlugin, ctx: SyncContext, rem: PluginRem,
   await setProp(rem, SOURCE_SLOTS.category, await refValue(plugin, ref));
 }
 
+/** Find-or-create the child named `name` under `parent` — one level of the Dates tree. A new one goes
+ *  in date ORDER among its siblings (their names are zero-padded numbers, so text order is date order);
+ *  setParent alone would prepend it. */
+async function ensureDateChild(plugin: RNPlugin, ctx: SyncContext, parent: PluginRem, name: string): Promise<PluginRem> {
+  const found = await oldestChildByName(plugin, ctx, parent, name);
+  if (found) return found;
+  const kids = await parent.getChildrenRem();
+  let pos = kids.length;
+  for (let i = 0; i < kids.length; i++) {
+    const n = (await remName(plugin, kids[i])).trim();
+    if (n && n > name) {
+      pos = i;
+      break;
+    }
+  }
+  const rem = await plugin.rem.createRem();
+  if (!rem) throw new Error(`Failed to create the "${name}" date rem.`);
+  await rem.setText([name]);
+  await rem.setParent(parent, pos);
+  registerChildName(ctx, parent, name, rem);
+  return rem;
+}
+
+/** The `Readwise/Dates` path for `parts` ([year, month, day]): the year under the Dates doc, the month
+ *  under the year, the day under the month — as Remzot's `Zotero/Dates`. One rem per level. */
+async function ensureDatePathRems(plugin: RNPlugin, ctx: SyncContext, parts: string[]): Promise<PluginRem[]> {
+  let parent = await ensureLookupDoc(plugin, ctx, HIERARCHY.dates);
+  const rems: PluginRem[] = [];
+  for (const part of parts) {
+    parent = await ensureDateChild(plugin, ctx, parent, part);
+    rems.push(parent);
+  }
+  return rems;
+}
+
+/** Write the Date slot: the path's rems as references joined by "-" (‹2024›-‹05›-‹17›), so each part
+ *  links to every source from that year, month or day. Nothing to write without a dated highlight. */
+async function writeDate(plugin: RNPlugin, ctx: SyncContext, rem: PluginRem, parts: string[]): Promise<void> {
+  if (!parts.length) return;
+  const rems = await ensureDatePathRems(plugin, ctx, parts);
+  let b = plugin.richText.rem(rems[0]._id);
+  for (let i = 1; i < rems.length; i++) b = b.text('-').rem(rems[i]._id);
+  await setProp(rem, SOURCE_SLOTS.date, await b.value());
+}
+
 async function writeLocation(plugin: RNPlugin, ctx: SyncContext, rem: PluginRem, label: string): Promise<void> {
   const l = label.trim() || NOT_IN_READER;
   const ref = await ensureRefRem(plugin, ctx, HIERARCHY.locations, l);
@@ -1200,8 +1260,15 @@ async function ownHighlightStart(doc: PluginRem): Promise<number> {
   return i >= 0 ? i : children.length;
 }
 
-/** Create one highlight bullet: markdown-parsed text (color-formatted when `applyColor`), with an
- *  optional note child. The rich text is built BEFORE the rem exists (a parse failure leaves nothing
+/** How a new highlight bullet looks: its Readwise colour, and where it sits in its source. */
+interface HighlightLook {
+  colors: boolean;
+  location: boolean;
+}
+const lookOf = (ctx: SyncContext): HighlightLook => ({ colors: ctx.applyColors, location: ctx.showLocation });
+
+/** Create one highlight bullet: markdown-parsed text (color-formatted when `look.colors`, followed by its
+ *  location when `look.location`), with an optional note child. The rich text is built BEFORE the rem exists (a parse failure leaves nothing
  *  behind), the rem is parented FIRST (under the Readwise root it is removable), and any failure after
  *  that removes the partial bullet again — the highlight isn't ledgered, so the next run re-adds it
  *  cleanly instead of duplicating it. */
@@ -1209,13 +1276,13 @@ async function addHighlight(
   plugin: RNPlugin,
   sourceDoc: PluginRem,
   h: ReadwiseHighlight,
-  applyColor: boolean,
+  look: HighlightLook,
   position: number,
   log?: SyncLog
 ): Promise<void> {
   const text = (h.text ?? '').trim() || '(empty highlight)';
   let rt = await plugin.richText.parseFromMarkdown(text);
-  const fmt = applyColor ? colorFormat(h.color) : undefined;
+  const fmt = look.colors ? colorFormat(h.color) : undefined;
   if (fmt) {
     // Colour is decoration: if the host rejects the format name (it validates more strictly than the
     // SDK's own types — 'Pink' type-checks but throws), import the highlight PLAIN rather than lose it.
@@ -1228,6 +1295,10 @@ async function addHighlight(
       log?.log('apply', `  highlight ${h.id}: colour "${fmt}" rejected by RemNote (${errMsg(err)}) — imported as plain text.`);
     }
   }
+  // "Show each highlight's location" (default OFF; REMINDERS.md R-008, 2026-11-25): where it sits in its
+  // source, as plain text after the highlight — outside the colour range, before the pin.
+  const where = look.location ? highlightLocationLabel(h) : '';
+  if (where) rt = [...rt, ` (${where})`];
   // Append a 📌 pin — a markdown hyperlink to the highlight's classic Readwise open-link
   // (readwise.io/open/<id>) — preceded by an explicit space element so it's separated from the
   // highlight text (parseFromMarkdown trims a leading space). Parsed separately so the pin never
@@ -1501,6 +1572,14 @@ async function diffSource(
   if (es.authorDangling) heal('author', 'dangling', displayValue(wantAuthor));
   heal('category', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.category, { wantNonEmpty: !!wantCat, els: catRt }), displayValue(wantCat));
   if (loc.known) heal('location', locHealth, displayValue(loc.label)); // a known label is never blank
+  // Date (R-010): repair-only — missing, broken or short — never value-diffed (see SOURCE_UPDATABLE).
+  const wantDate = firstHighlightDateParts(source);
+  if (wantDate.length)
+    heal(
+      'date',
+      await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.date, { wantNonEmpty: true, wantCount: wantDate.length }),
+      displayValue(wantDate.join('-'))
+    );
   if (linkKnown)
     heal('link', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.link, { wantNonEmpty: !!wantLink, els: linkRt }), displayValue(wantLink));
 
@@ -2086,6 +2165,9 @@ async function applyUpdate(
       case 'cover':
         if (source) await writeCover(plugin, rem, (source.cover_image_url ?? '').trim());
         break;
+      case 'date': // repair-only too (see SOURCE_UPDATABLE)
+        if (source) await writeDate(plugin, ctx, rem, firstHighlightDateParts(source));
+        break;
     }
   }
   // Re-seed the RAW title on any update that carries a source (not just a rename): the display name is
@@ -2135,6 +2217,7 @@ async function createSourceDoc(
 
     await writeAuthor(plugin, ctx, rem, (s.author ?? '').trim());
     await writeCategory(plugin, ctx, rem, categoryLabelOf(s));
+    await writeDate(plugin, ctx, rem, firstHighlightDateParts(s));
     // An unknown location (Reader sweep incomplete this run) is left EMPTY so the next complete
     // sweep's diff fills it in — it is never asserted as "Not in Reader". In `readerWhenArchived` mode a
     // doc enrolled at its first sync gets its Location only once that enrolment has been carried out
@@ -2177,7 +2260,7 @@ async function createSourceDoc(
     };
     for (const h of entry.eligible) {
       try {
-        await addHighlight(plugin, rem, h, ctx.applyColors, pos, log);
+        await addHighlight(plugin, rem, h, lookOf(ctx), pos, log);
         pos += 1; // only on success — a failed highlight removes itself, so the position is unchanged
         added.add(String(h.id));
         sinceCheckpoint += 1;
@@ -2199,7 +2282,7 @@ async function createSourceDoc(
       let supPos = (await supRem.getChildrenRem()).length;
       for (const h of entry.supplements) {
         try {
-          await addHighlight(plugin, supRem, h, ctx.applyColors, supPos, log);
+          await addHighlight(plugin, supRem, h, lookOf(ctx), supPos, log);
           supPos += 1;
           added.add(String(h.id));
           sinceCheckpoint += 1;
@@ -2298,7 +2381,7 @@ async function applyAddHighlights(
   rem: PluginRem,
   highlights: ReadwiseHighlight[],
   syncedAt: number,
-  applyColor: boolean,
+  look: HighlightLook,
   log?: SyncLog
 ): Promise<{ added: number; failed: number }> {
   const ledger = await readLedger(rem, log);
@@ -2312,7 +2395,7 @@ async function applyAddHighlights(
     const h = highlights[i];
     if (ledger.has(String(h.id))) continue;
     try {
-      await addHighlight(plugin, rem, h, applyColor, pos, log);
+      await addHighlight(plugin, rem, h, look, pos, log);
       pos += 1;
       ledger.add(String(h.id));
       added += 1;
@@ -2352,7 +2435,7 @@ async function applyAddSupplements(
   rem: PluginRem,
   highlights: ReadwiseHighlight[],
   syncedAt: number,
-  applyColor: boolean,
+  look: HighlightLook,
   log?: SyncLog
 ): Promise<{ added: number; failed: number }> {
   const ledger = await readLedger(rem, log);
@@ -2365,7 +2448,7 @@ async function applyAddSupplements(
     const h = highlights[i];
     if (ledger.has(String(h.id))) continue;
     try {
-      await addHighlight(plugin, supRem, h, applyColor, pos, log);
+      await addHighlight(plugin, supRem, h, look, pos, log);
       pos += 1;
       ledger.add(String(h.id));
       added += 1;
@@ -2509,7 +2592,7 @@ export async function applySyncPlan(
   for (const { entry, highlightIds } of selection.toAddHighlights) {
     try {
       const picked = entry.highlights.filter((h) => highlightIds.has(h.id));
-      const { added, failed: hlFailed } = await applyAddHighlights(plugin, entry.rem, picked, syncedAt, ctx.applyColors, log);
+      const { added, failed: hlFailed } = await applyAddHighlights(plugin, entry.rem, picked, syncedAt, lookOf(ctx), log);
       highlightsAdded += added;
       highlightsFailed += hlFailed;
       // The original "earned new content" rule, decided at plan time (`entry.makeIncremental`): an
@@ -2529,7 +2612,7 @@ export async function applySyncPlan(
   for (const { entry, highlightIds } of selection.toAddSupplements) {
     try {
       const picked = entry.highlights.filter((h) => highlightIds.has(h.id));
-      const { added, failed: hlFailed } = await applyAddSupplements(plugin, entry.rem, picked, syncedAt, ctx.applyColors, log);
+      const { added, failed: hlFailed } = await applyAddSupplements(plugin, entry.rem, picked, syncedAt, lookOf(ctx), log);
       supplementsAdded += added;
       highlightsFailed += hlFailed;
       // Same enrolment rule as own-highlights: a source that just earned content gets enrolled.

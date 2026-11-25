@@ -116,7 +116,14 @@ if (isProd) {
   config.devServer = {
     port: 8080,
     open: true,
-    hot: true,
+    // No live-reload client (as in the Incremental Everything fork; REMINDERS.md R-017, 2026-11-25):
+    // RemNote runs plugin widgets in sandboxed iframes (Origin: null), which the dev server's WebSocket
+    // check rejects, so the client only ever looped "Trying to reconnect…" in the console — and the
+    // index frame never live-reloaded anyway (reload the plugin to pick up an engine edit).
+    hot: false,
+    liveReload: false,
+    client: false,
+    webSocketServer: false,
     compress: true,
     watchFiles: ['src/*'],
     headers: {

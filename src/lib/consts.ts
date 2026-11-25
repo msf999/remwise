@@ -8,6 +8,9 @@ export const SETTINGS = {
   tagFilter: 'readwise-tag-filter',
   /** When ON, apply each highlight's Readwise color as a RemNote highlight color. Default OFF. */
   applyColors: 'readwise-apply-colors',
+  /** When ON, a NEW highlight ends with where it sits in its source ("p. 42", "loc. 1234", "12:34").
+   *  Default OFF (mo, 2026-11-25: "build it but make it off by default"; REMINDERS.md R-008). */
+  showLocation: 'readwise-show-highlight-location',
   /**
    * When ON, enrol source docs in Incremental Everything — WHEN is decided by `readerOnlyWhenArchived`.
    * (The id predates that option, when "on create" was the only behaviour; ids are permanent.)
@@ -111,6 +114,9 @@ export const SOURCE_SLOTS = {
   // Visible, plugin-owned metadata (display order).
   author: 'author',
   category: 'category',
+  /** The day of the source's FIRST highlight as a Year-Month-Day reference path under `Readwise/Dates`
+   *  (‹2024›-‹05›-‹17›), as Remzot's Date is under `Zotero/Dates` (REMINDERS.md R-010, 2026-11-25). */
+  date: 'date',
   location: 'location',
   link: 'link',
   readwiseUrl: 'readwiseUrl',
@@ -141,8 +147,13 @@ export const SOURCE_SLOTS = {
  * never round-trips, so comparing either stages a row that can never be satisfied (the Zot2Rem lesson).
  * `diffSource` reaches them exclusively through the STRUCTURAL `slotHealth` check. See the self-heal
  * block there and the 2026-09-11 changelog entry.
+ *
+ * `date` (2026-11-25) is repair-only too, for another reason: it is the browser's LOCAL day of the first
+ * highlight, so value-diffing it would re-date part of the library whenever a sync runs in another time
+ * zone. It is written on create, and on an existing doc only when missing, broken or short — which is
+ * also how every doc made before it existed gets one.
  */
-export const SOURCE_UPDATABLE = ['name', 'author', 'category', 'location', 'link', 'readwise', 'cover'] as const;
+export const SOURCE_UPDATABLE = ['name', 'author', 'category', 'date', 'location', 'link', 'readwise', 'cover'] as const;
 export type UpdatableField = (typeof SOURCE_UPDATABLE)[number];
 
 /**
@@ -155,6 +166,8 @@ export const HIERARCHY = {
   categories: 'Categories',
   authors: 'Authors',
   locations: 'Locations',
+  /** A Year → Month → Day tree; each source's Date property references one path through it. */
+  dates: 'Dates',
 } as const;
 
 /** Reader (v3) `location` value → display label. Non-Reader sources get `NOT_IN_READER`. */

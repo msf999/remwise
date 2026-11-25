@@ -50,6 +50,16 @@ async function onActivate(plugin: ReactRNPlugin) {
     defaultValue: false,
   });
 
+  await plugin.settings.registerBooleanSetting({
+    id: SETTINGS.showLocation,
+    title: "Show each highlight's location",
+    description:
+      'When ON, each NEW highlight ends with where it sits in its source: "p. 42" for a page, "loc. 1234" ' +
+      'for a Kindle location, "12:34" for a podcast or video (sources that give no such place get nothing). ' +
+      'Highlights already in RemNote are never edited, so they stay as they are. OFF by default.',
+    defaultValue: false,
+  });
+
   for (const c of CATEGORIES) {
     await plugin.settings.registerBooleanSetting({
       id: categorySettingId(c),
@@ -104,6 +114,9 @@ async function onActivate(plugin: ReactRNPlugin) {
         { code: SOURCE_SLOTS.author, name: 'Author', onlyProgrammaticModifying: true,
           propertyType: PropertyType.TEXT, propertyLocation: PropertyLocation.ONLY_DOCUMENT },
         { code: SOURCE_SLOTS.category, name: 'Category', onlyProgrammaticModifying: true,
+          propertyType: PropertyType.TEXT, propertyLocation: PropertyLocation.ONLY_DOCUMENT },
+        // The day of the source's first highlight, as a Year-Month-Day path under Readwise/Dates (2026-11-25).
+        { code: SOURCE_SLOTS.date, name: 'Date', onlyProgrammaticModifying: true,
           propertyType: PropertyType.TEXT, propertyLocation: PropertyLocation.ONLY_DOCUMENT },
         { code: SOURCE_SLOTS.location, name: 'Location', onlyProgrammaticModifying: true,
           propertyType: PropertyType.TEXT, propertyLocation: PropertyLocation.ONLY_DOCUMENT },

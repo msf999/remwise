@@ -1,7 +1,7 @@
 /** Add-only sync: copy tagged Readwise highlights into `Readwise / Sources` and keep source metadata
  *  fresh. Highlights are plain bullets (dedup via a per-source ledger); sources have a powerup with
  *  metadata + a hidden ledger. Adapted from the Zot2Rem sync engine. */
-import { type PluginRem, type RNPlugin, type RichTextInterface } from '@remnote/plugin-sdk';
+import { PORTAL_TYPE, RemType, type PluginRem, type RNPlugin, type RichTextInterface } from '@remnote/plugin-sdk';
 import {
   AUTHOR_TITLE_SEP,
   CATEGORY_LABEL,
@@ -109,7 +109,10 @@ export interface SourceCreateEntry {
   /** Enrol the new doc in Incremental Everything as part of this create — decided at PLAN time, so the
    *  preview can say so: always in `always` mode; in `readerWhenArchived` mode for a source archived
    *  in Reader or one with no "done" signal at all (not in Reader), never for one still being read.
-   *  (A Reader doc created un-archived is offered a `toMakeIncremental` row once it is.) */
+   *  Never for a supplement document (the fold deletes it, and its IE history with it). (A Reader doc
+   *  created un-archived is offered a `toMakeIncremental` row by the sync that sees it move into the
+   *  Archive.) In `readerWhenArchived` mode the doc's Location is written only once this enrolment has
+   *  been carried out, so a failed one leaves it empty and the next sync offers it again. */
   makeIncremental: boolean;
 }
 
@@ -130,7 +133,9 @@ export interface SourceAddHighlights {
   rem: PluginRem;
   highlights: ReadwiseHighlight[]; // selectable ids are `ha:<remId>:<hlId>`
   /** Enrol the doc in Incremental Everything once ≥1 highlight lands — the original "earned new
-   *  content" rule, decided at PLAN time (incl. that the doc is neither incremental nor dismissed yet). */
+   *  content" rule, `always` mode ONLY (in `readerWhenArchived` mode a doc is enrolled once, at its
+   *  first sync or on its move into the Archive — never because it gained content). Decided at PLAN
+   *  time, incl. that the doc is neither incremental nor dismissed yet. */
   makeIncremental: boolean;
 }
 
@@ -141,7 +146,7 @@ export interface SupplementAddEntry {
   name: string;
   rem: PluginRem;
   highlights: ReadwiseHighlight[]; // selectable ids are `hs:<remId>:<hlId>`
-  /** As on `SourceAddHighlights`: enrol once ≥1 supplement lands (the original rule). */
+  /** As on `SourceAddHighlights`: enrol once ≥1 supplement lands (the original rule; `always` only). */
   makeIncremental: boolean;
 }
 
@@ -156,12 +161,45 @@ export interface KeptEntry {
  *  - `off`                — the setting is off, or IE is not installed: nothing is enrolled.
  *  - `always`             — the original rule: every new doc on create, and an existing doc when it
  *                           gains a highlight or supplement (event-driven, riding along with those rows).
- *  - `readerWhenArchived` — the default. A READER source waits until it is archived (= done): enrolled
- *                           on create if it already is, else via its own `toMakeIncremental` row once it
- *                           is (state-driven). Every source with no "done" signal — not in Reader —
- *                           follows the original rule, as `always` (the user's choice, 2026-11-24).
+ *  - `readerWhenArchived` — the default. A doc is enrolled ONCE, on an event (the user's rule,
+ *                           2026-11-25): at its first sync if it is archived in Reader or has no "done"
+ *                           signal at all (not in Reader); otherwise — a Reader source still being read —
+ *                           at the sync that sees it MOVE into the Archive (its own `toMakeIncremental`
+ *                           row). Gaining content never enrols it, and a doc already archived when this
+ *                           rule first sees it — the backlog — is never offered. The doc's stored
+ *                           Location is the memory of where it was last time; see `StoredLocation`.
  */
 export type IncrementalMode = 'off' | 'always' | 'readerWhenArchived';
+
+/** Why an EXISTING doc is offered a `toMakeIncremental` row (`readerWhenArchived` mode only):
+ *  - `moved` — its stored Location is a non-Archive place and Reader now has it in the Archive: the
+ *              user finished it since the last sync.
+ *  - `first` — its stored Location is still EMPTY although its first-sync rule says "enrol" (archived,
+ *              or no "done" signal): that first-sync enrolment never happened — it failed, the apply
+ *              was cut short, or the sweep could not place the doc then. The Location is written only
+ *              once the enrolment is carried out, so this is how a failed one comes back. */
+export type IncrementalReason = 'moved' | 'first';
+
+/** What an existing doc's Location property says about where it was at the LAST sync. Only a readable,
+ *  recognised value can make a move: a dangling reference or a failed read is "don't know", never a
+ *  move — concluding one from a broken slot could enrol a whole library at once. */
+type StoredLocation =
+  | { kind: 'label'; label: string } // a readable value — a Location label, or anything else
+  | { kind: 'empty' } // never written (see `IncrementalReason` 'first')
+  | { kind: 'broken' } // a reference to a deleted lookup rem
+  | { kind: 'unreadable' }; // the read failed, or the location is unknown this run
+
+/** The Location labels that mean "somewhere other than the Archive": a doc stored with one of these and
+ *  archived in Reader now has MOVED into the Archive. Anything else (a renamed lookup rem, say) is not
+ *  recognised and makes no move. */
+const NON_ARCHIVE_LOCATIONS = new Set(
+  [
+    ...Object.entries(LOCATION_LABEL)
+      .filter(([value]) => value !== READER_ARCHIVE)
+      .map(([, label]) => label),
+    NOT_IN_READER,
+  ].map((label) => nameKey(label)) // a function declaration below — hoisted, so callable here
+);
 
 /** What this run knows about whether the user has finished a source. Mirrors the Location property:
  *  - `archived`  — in Reader's archive: done.
@@ -173,12 +211,17 @@ export type IncrementalMode = 'off' | 'always' | 'readerWhenArchived';
  *  - `unknown`   — a Reader source an INCOMPLETE sweep did not reach. Never read as done. */
 type DoneState = 'archived' | 'reading' | 'no-signal' | 'unknown';
 
-/** An EXISTING doc whose source is archived in Reader and that is neither incremental nor dismissed in
- *  Incremental Everything yet → enrol it (`readerWhenArchived` mode only). */
+/** An EXISTING doc to enrol in Incremental Everything (`readerWhenArchived` mode only): it moved into
+ *  the Archive since the last sync, or its first-sync enrolment never happened (`reason`) — and it is
+ *  neither incremental nor dismissed in IE. The row also writes the doc's new Location (when that
+ *  field is ticked on its update row), and only AFTER the enrolment succeeded: an enrolment that fails
+ *  leaves the old Location, so the next sync sees the same move and offers it again. Unticking the row
+ *  instead lets the update row record the move — "not this one", and it is not offered again. */
 export interface IncrementalEntry {
   id: string; // `mi:<remId>`
   name: string;
   rem: PluginRem;
+  reason: IncrementalReason;
 }
 
 /** The full set of changes a sync would make (add-only). */
@@ -191,10 +234,15 @@ export interface SyncPlan {
   toMergeSupplementDocs: SupplementMerge[];
   /** Duplicate lookup rems a cross-device race created. Destructive, so it is a row like any other. */
   toFoldLookupDuplicates: LookupDuplicate[];
-  /** Existing docs to enrol in Incremental Everything because their source is now archived in Reader. */
+  /** Existing docs to enrol in Incremental Everything: moved into the Archive since the last sync, or
+   *  not enrolled at their first sync after all (see `IncrementalEntry`). */
   toMakeIncremental: IncrementalEntry[];
   /** The enrolment rule this plan was computed under (the popup words its hints from it). */
   incMode: IncrementalMode;
+  /** Set only when "Make source docs Incremental" is ON but Incremental Everything is not running: how
+   *  many docs this sync would have enrolled. Nothing is enrolled, and applying records their first sync
+   *  or their move into the Archive all the same, so they are not offered again — the popup warns. */
+  incMissed?: number;
   alreadyInSync: KeptEntry[];
   fetchedSources: number;
   matchingHighlights: number;
@@ -259,6 +307,10 @@ export interface SyncContext {
   /** Decided once, when the context is built — the preview is the contract, so the apply never
    *  re-reads the settings (a toggle flipped between preview and apply must not change what it does). */
   incMode: IncrementalMode;
+  /** What the SETTINGS ask for, whether or not IE is running. Differs from `incMode` only when the
+   *  option is on and IE is not running (`incMode` is then 'off'): the plan counts what it would have
+   *  enrolled, for the popup's warning (`SyncPlan.incMissed`). */
+  incWanted: IncrementalMode;
   incSetup?: IncSetup | null;
 }
 
@@ -274,7 +326,24 @@ function nameKey(s: string): string {
 }
 
 /** True for RemNote's internal machinery rems (powerup defs, slots, property rems). Never content. */
+/**
+ * RemNote's hidden References section: a SEARCH portal it stores INSIDE a document (`query:<the doc>`)
+ * the first time a doc with backlinks is shown. It never renders as a bullet, but `getChildrenRem()`
+ * returns it, so a fold used to MOVE it as if it were content — into the canonical lookup rem, or into a
+ * main document's Supplements section (review finding, 2026-11-24; Remzot's `isSearchPortal`, its R-031).
+ * A portal the USER made is a different portal type and stays content. Only portals pay a host call.
+ */
+async function isSearchPortal(rem: PluginRem): Promise<boolean> {
+  if (rem.type !== RemType.PORTAL) return false;
+  try {
+    return (await rem.getPortalType()) === PORTAL_TYPE.SEARCH_PORTAL;
+  } catch {
+    return false;
+  }
+}
+
 async function isStructuralRem(rem: PluginRem): Promise<boolean> {
+  if (await isSearchPortal(rem)) return true;
   const flags = await Promise.all([
     rem.isPowerup().catch(() => false),
     rem.isPowerupProperty().catch(() => false),
@@ -296,6 +365,19 @@ async function getProp(rem: PluginRem, slot: string): Promise<string> {
 
 async function setProp(rem: PluginRem, slot: string, value: RichTextInterface): Promise<void> {
   await rem.setPowerupProperty(SOURCE_POWERUP, slot, value);
+}
+
+/**
+ * Stamp `lastSyncedAt`, best effort. Nothing reads it back — it is informational — so it must never fail
+ * a row whose real work (the writes and their ledger) is done. In a create, a throw here used to roll the
+ * whole FINISHED document back (review finding, 2026-11-24).
+ */
+async function stampSyncedAt(rem: PluginRem, syncedAt: number, log?: SyncLog): Promise<void> {
+  try {
+    await setProp(rem, SOURCE_SLOTS.lastSyncedAt, [String(syncedAt)]);
+  } catch (err) {
+    log?.log('apply', `  lastSyncedAt not written (${errMsg(err)}) — informational only; the row stands.`);
+  }
 }
 
 /** Read a slot as RichText (references preserved); undefined if unset/error. */
@@ -679,25 +761,31 @@ export async function findPowerup(plugin: RNPlugin, code: string): Promise<Plugi
   }
 }
 
-/** The Incremental Everything enrolment rule from the two settings, and whether IE is installed. A
- *  never-set "…Reader sources only once archived" reads as its default, ON. */
-async function readIncrementalMode(plugin: RNPlugin, log?: SyncLog): Promise<IncrementalMode> {
-  if (!(await plugin.settings.getSetting<boolean>(SETTINGS.initIncremental))) return 'off';
+/** The Incremental Everything enrolment rule the two settings ask for (`wanted`), and the one this run
+ *  can follow (`mode`: 'off' when IE is not running). A never-set "…Reader sources only once archived"
+ *  reads as its default, ON. */
+async function readIncrementalMode(
+  plugin: RNPlugin,
+  log?: SyncLog
+): Promise<{ wanted: IncrementalMode; mode: IncrementalMode }> {
+  if (!(await plugin.settings.getSetting<boolean>(SETTINGS.initIncremental))) return { wanted: 'off', mode: 'off' };
+  const readerGate = (await plugin.settings.getSetting<boolean>(SETTINGS.readerOnlyWhenArchived)) !== false;
+  const wanted: IncrementalMode = readerGate ? 'readerWhenArchived' : 'always';
   if (!(await findPowerup(plugin, IE.powerup))) {
     log?.log(
       'plan',
       'Incremental Everything is not installed or not enabled — no source will be made incremental.'
     );
-    return 'off';
+    return { wanted, mode: 'off' };
   }
-  const readerGate = (await plugin.settings.getSetting<boolean>(SETTINGS.readerOnlyWhenArchived)) !== false;
-  return readerGate ? 'readerWhenArchived' : 'always';
+  return { wanted, mode: wanted };
 }
 
 /** Build a SyncContext from the popup's inputs (tag filter, included categories and the Reader map are
  *  all read/fetched by the popup and passed in), read the colour and Incremental Everything settings,
  *  and scan existing sources. `incMode` overrides the settings — for the test suite, which must not
- *  depend on (or change) the account's settings. */
+ *  depend on (or change) the account's settings; `incWanted` (default: `incMode`) lets it stage "the
+ *  option is on but IE is not running" without switching IE off. */
 export async function buildSyncContext(
   plugin: RNPlugin,
   opts: {
@@ -706,6 +794,7 @@ export async function buildSyncContext(
     readerByExternalId: Map<string, ReaderInfo>;
     readerComplete: boolean;
     incMode?: IncrementalMode;
+    incWanted?: IncrementalMode;
     log?: SyncLog;
   }
 ): Promise<SyncContext> {
@@ -721,15 +810,20 @@ export async function buildSyncContext(
     throw new Error(msg);
   }
   const applyColors = (await plugin.settings.getSetting<boolean>(SETTINGS.applyColors)) ?? false;
-  const incMode = opts.incMode ?? (await readIncrementalMode(plugin, opts.log));
+  const modes = opts.incMode
+    ? { wanted: opts.incWanted ?? opts.incMode, mode: opts.incMode }
+    : await readIncrementalMode(plugin, opts.log);
+  const incMode = modes.mode;
   opts.log?.log(
     'plan',
     `Incremental Everything: ${
       incMode === 'off'
-        ? 'off'
+        ? modes.wanted === 'off'
+          ? 'off'
+          : 'wanted, but not running — nothing will be enrolled'
         : incMode === 'always'
           ? 'enrol every new source, and any that gains a highlight'
-          : 'enrol a Reader source once it is archived; every other source when created or when it gains a highlight'
+          : 'enrol each source once — at its first sync, or (a Reader source still being read) when it moves into the Archive'
     }.`
   );
   const ctx: SyncContext = {
@@ -745,6 +839,7 @@ export async function buildSyncContext(
     existingSources: [],
     sourceByBookId: new Map(),
     incMode,
+    incWanted: modes.wanted,
     incSetup: undefined,
   };
   await scanExistingSources(plugin, ctx, opts.log);
@@ -1223,34 +1318,48 @@ async function enrolIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncConte
   }
   const setup = await getIncSetup(plugin, ctx, log);
   if (!setup) throw new Error('Incremental Everything is not installed (or making sources incremental is off)');
-  // Replicate IE's initIncrementalRem writes exactly (verified against the IE source) so the rem is
-  // byte-identical to an IE-native one. nextRepDate = today → due now; originalIncDate + firstAdded
-  // = today too; priority + rotation as single-element string arrays; repHist = the madeIncremental
-  // marker. (firstAdded/rotation aren't required to PARSE as incremental, but IE writes them and its
-  // UI reads them, so we match.)
-  await rem.addPowerup(IE.powerup);
+  // Write the slots IE's initIncrementalRem writes (codes verified against the IE source): nextRepDate,
+  // originalIncDate and firstAdded = today's daily-doc reference; priority + rotation as single-element
+  // string arrays; repHist = the madeIncremental marker. NOT byte-identical to IE's own enrolment: IE
+  // takes the default priority from ITS settings and dates the first review today + its Initial
+  // Interval, which another plugin cannot read — Remwise uses 10 (or an incremental parent's) and today.
+  //
+  // The daily doc comes FIRST and the powerup is taken off again if any later write fails (review
+  // finding, 2026-11-24): `incrementalBlocker` reads the bare powerup as "already incremental", so a
+  // doc left half-enrolled was never offered again — and without a daily doc it got no dates at all,
+  // a rem IE's own init refuses to make.
   const dailyDoc = await plugin.date.getDailyDoc(new Date());
   const dateRef = dailyDoc ? await plugin.richText.rem(dailyDoc).value() : undefined;
-  if (dateRef) {
+  if (!dateRef) throw new Error("today's daily document could not be read, so the doc was not made incremental");
+  await rem.addPowerup(IE.powerup);
+  try {
     await rem.setPowerupProperty(IE.powerup, IE.nextRepDateSlot, dateRef);
     await rem.setPowerupProperty(IE.powerup, IE.originalIncDateSlot, dateRef);
     await rem.setPowerupProperty(IE.powerup, IE.firstAddedSlot, dateRef);
+    await rem.setPowerupProperty(IE.powerup, IE.prioritySlot, [setup.priority]);
+    await rem.setPowerupProperty(IE.powerup, IE.rotationSlot, [setup.rotation]);
+    const parsedPriority = Number(setup.priority);
+    const priorityNum = Number.isFinite(parsedPriority) ? parsedPriority : IE.defaultPriority;
+    const marker = { date: Date.now(), scheduled: Date.now(), eventType: 'madeIncremental', priority: priorityNum };
+    await rem.setPowerupProperty(IE.powerup, IE.repHistSlot, [JSON.stringify([marker])]);
+  } catch (err) {
+    // Undo, so the doc reads as not-incremental and comes back (a row next sync, or its next ride-along).
+    try {
+      await rem.removePowerup(IE.powerup);
+    } catch (undoErr) {
+      log?.log('apply', `  could NOT take the half-written Incremental powerup off again (${errMsg(undoErr)}) — remove it by hand so the doc is offered again.`);
+    }
+    throw err;
   }
-  await rem.setPowerupProperty(IE.powerup, IE.prioritySlot, [setup.priority]);
-  await rem.setPowerupProperty(IE.powerup, IE.rotationSlot, [setup.rotation]);
-  const parsedPriority = Number(setup.priority);
-  const priorityNum = Number.isFinite(parsedPriority) ? parsedPriority : IE.defaultPriority;
-  const marker = { date: Date.now(), scheduled: Date.now(), eventType: 'madeIncremental', priority: priorityNum };
-  await rem.setPowerupProperty(IE.powerup, IE.repHistSlot, [JSON.stringify([marker])]);
   log?.log('apply', `Made source incremental (priority ${setup.priority}, rotation ${setup.rotation}).`);
   return true;
 }
 
-/** The ride-along form, for a create / add-highlights / add-supplements row: enrolment is secondary to
- *  what that row does, so a failure is logged and never fails the row. (An archived Reader doc whose
- *  enrolment failed here is offered its own row by the next sync — it is still archived and still not
- *  incremental; any other doc is retried the next time it gains a highlight, as it always was.)
- *  Returns true when it enrolled the doc. */
+/** The ride-along form, for an add-highlights / add-supplements row (`always` mode) and a create in
+ *  `always` mode: enrolment is secondary to what that row does, so a failure is logged and never fails
+ *  the row; such a doc is retried the next time it gains a highlight, as it always was. (A create in
+ *  `readerWhenArchived` mode calls `enrolIncremental` itself, holding the Location back until it has
+ *  worked — see `createSourceDoc`.) Returns true when it enrolled the doc. */
 async function makeIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncContext, log?: SyncLog): Promise<boolean> {
   try {
     return await enrolIncremental(plugin, rem, ctx, log);
@@ -1264,14 +1373,16 @@ async function makeIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncContex
 
 const displayValue = (s: string): string => (s.trim() ? (s.length > 80 ? s.slice(0, 79) + '…' : s) : '(empty)');
 
-/** Compare an existing source's stored slots/name against fresh Readwise metadata. */
+/** Compare an existing source's stored slots/name against fresh Readwise metadata. Also reports what the
+ *  stored Location says (`StoredLocation`; 'unreadable' when this run does not know the location and so
+ *  never read it) — the memory the Incremental Everything rule needs to see a MOVE into the Archive. */
 async function diffSource(
   plugin: RNPlugin,
   ctx: SyncContext,
   es: ExistingSource,
   source: ReadwiseSource,
   desiredName: string | undefined
-): Promise<FieldChange[]> {
+): Promise<{ changes: FieldChange[]; storedLocation: StoredLocation }> {
   const changes: FieldChange[] = [];
 
   // NOTE: 'name' is the only field whose `toDisplay` is WRITTEN verbatim by applyUpdate (setText), so
@@ -1292,11 +1403,25 @@ async function diffSource(
 
   const loc = desiredLocation(source, ctx);
   let locRt: RichTextInterface | undefined;
+  let locHealth: SlotHealth = 'unknown';
+  let storedLocation: StoredLocation = { kind: 'unreadable' };
   if (loc.known) {
     locRt = await getSlotRichText(es.rem, SOURCE_SLOTS.location);
     const curLoc = await slotToComparable(plugin, ctx.refNameCache, locRt);
     if (nameKey(curLoc) !== nameKey(loc.label))
       changes.push({ field: 'location', fromDisplay: displayValue(curLoc), toDisplay: displayValue(loc.label) });
+    // Structural verdict, once, for both the repair below and the stored-Location reading. With no
+    // `locRt` (unset, or a read `getSlotRichText` swallowed) `slotHealth` re-reads STRICTLY, so a failed
+    // read comes back 'unknown' — never 'empty', which would look like an unfinished first sync.
+    locHealth = await slotHealth(plugin, ctx.refNameCache, es.rem, SOURCE_SLOTS.location, { wantNonEmpty: true, els: locRt });
+    storedLocation =
+      locHealth === 'dangling'
+        ? { kind: 'broken' }
+        : locHealth === 'empty'
+          ? { kind: 'empty' }
+          : locHealth === 'ok' && locRt !== undefined
+            ? { kind: 'label', label: curLoc }
+            : { kind: 'unreadable' };
   }
 
   // Link = the v2 source_url, else the Reader doc's source URL. When the source has no v2 URL and its
@@ -1342,8 +1467,7 @@ async function diffSource(
   // author, and when it doesn't there is nothing to write.
   if (es.authorDangling) heal('author', 'dangling', displayValue(wantAuthor));
   heal('category', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.category, { wantNonEmpty: !!wantCat, els: catRt }), displayValue(wantCat));
-  if (loc.known)
-    heal('location', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.location, { wantNonEmpty: !!loc.label, els: locRt }), displayValue(loc.label));
+  if (loc.known) heal('location', locHealth, displayValue(loc.label)); // a known label is never blank
   if (linkKnown)
     heal('link', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.link, { wantNonEmpty: !!wantLink, els: linkRt }), displayValue(wantLink));
 
@@ -1367,7 +1491,7 @@ async function diffSource(
   const wantCover = (source.cover_image_url ?? '').trim();
   heal('cover', await slotHealth(plugin, cache, es.rem, SOURCE_SLOTS.cover, { wantNonEmpty: !!wantCover }), displayValue(wantCover));
 
-  return changes;
+  return { changes, storedLocation };
 }
 
 // ───────────────────────── Compute plan ─────────────────────────
@@ -1492,7 +1616,8 @@ export async function computeSyncPlan(
 
   /** Supplement highlights to append under an EXISTING main doc's `Supplements` header. */
   const supplementsByRemId = new Map<string, { es: ExistingSource; highlights: ReadwiseHighlight[] }>();
-  /** New highlights for a supplement DOCUMENT that is still waiting for its main source. */
+  /** New highlights for a supplement DOCUMENT — one still waiting for its main source, or one whose fold
+   *  into it is staged this same run (see branch 1 below). */
   const supplementDocAdds = new Map<string, { es: ExistingSource; highlights: ReadwiseHighlight[] }>();
   /** Supplement documents whose main source now EXISTS — fold them in. */
   const toMergeSupplementDocs: SupplementMerge[] = [];
@@ -1536,16 +1661,26 @@ export async function computeSyncPlan(
           ledgerCount: suppDoc.ledger.size,
         });
       }
-      // While a holding doc is being folded in THIS run, append nothing to the main doc: let the fold
-      // move the real bullets, and append whatever is still missing on the NEXT run. Two reasons — and
-      // one non-reason, stated plainly:
+      // While a holding doc is being folded in THIS run, append nothing to the MAIN doc: let the fold
+      // move the real bullets. Two reasons — and one non-reason, stated plainly:
       //   • ordering: the fold appends below whatever `applyAddSupplements` already wrote, so appending
       //     first would put the newest highlights ABOVE the folded ones.
       //   • one writer per `Supplements` rem per apply, which is far easier to reason about.
       //   • NOT a duplication fix. A bullet the holding doc holds but never recorded is invisible to
       //     both designs: appending now duplicates it now, deferring duplicates it next run. What
       //     actually keeps that set empty is the strict `readLedger` and the small LEDGER_CHECKPOINT.
-      if (suppDoc) continue;
+      // The new highlights go to the HOLDING doc instead, as an ordinary add row: adds run before
+      // merges, so the fold carries them over below the older ones, and the fold re-reads both
+      // ledgers when it runs. They used to be deferred to the next run — staged NOWHERE, and never
+      // shown, for as long as the merge stayed unticked or kept failing (review finding, 2026-11-24).
+      if (suppDoc) {
+        const mainLedger = target.es.ledger;
+        const fresh = eligible.filter(
+          (h) => !suppDoc.ledger.has(String(h.id)) && !mainLedger.has(String(h.id))
+        );
+        if (fresh.length) supplementDocAdds.set(suppDoc.rem._id, { es: suppDoc, highlights: fresh });
+        continue;
+      }
       // Hoisted: `target` is a `let`, so TS drops its narrowing inside a closure.
       const mainDoc = target.es;
       const fresh = eligible.filter((h) => !mainDoc.ledger.has(String(h.id)));
@@ -1665,23 +1800,45 @@ export async function computeSyncPlan(
     newName.get(source.user_book_id) ??
     displayBase(baseTitleOf(source), (source.author ?? '').trim()) + (isSupplementDoc ? SUPPLEMENT_DOC_SUFFIX : '');
   // ── Incremental Everything: who is enrolled, decided HERE so the preview shows it ──────────────────
-  // `readerWhenArchived` (the default): a Reader source waits for the archive; a source with NO "done"
-  // signal (not in Reader) keeps the original rule — enrolled on create, or when it gains content; a
-  // Reader source this run could not place (`unknown`) is left for a run that can.
+  // `readerWhenArchived` (the default) enrols each doc ONCE, on an event: at its first sync when it is
+  // archived in Reader or has no "done" signal (not in Reader); a Reader source still being read, at the
+  // sync that sees it MOVE into the Archive; a Reader source this run could not place (`unknown`), on a
+  // later run that can. Gaining content never enrols it. `always` is the original rule: every create,
+  // and every doc that gains content. A supplement document is enrolled in NEITHER: the fold deletes
+  // it, and its IE history with it (review finding 9, 2026-11-24). With the option on but IE not
+  // running (`incMode` 'off'), each decision is still made under the WANTED rule — only to be counted
+  // for the popup's warning (`incMissed`); nothing is staged.
+  const incRule: IncrementalMode = ctx.incMode !== 'off' ? ctx.incMode : ctx.incWanted;
+  const ieMissing = ctx.incMode === 'off' && ctx.incWanted !== 'off';
+  const missed = new Set<string>();
+  /** Stage an enrolment decision — or, while IE is not running, only count it (once per doc). */
+  const stage = (wanted: boolean, key: string): boolean => {
+    if (wanted && ieMissing) {
+      missed.add(key);
+      return false;
+    }
+    return wanted;
+  };
   /** Whether a doc CREATED this run is enrolled as part of its create. */
   const enrolOnCreate = (source: ReadwiseSource): boolean => {
-    if (ctx.incMode === 'always') return true;
-    if (ctx.incMode !== 'readerWhenArchived') return false;
+    if (incRule === 'always') return true;
+    if (incRule !== 'readerWhenArchived') return false;
     const state = doneStateOf(source.external_id, ctx);
     return state === 'archived' || state === 'no-signal';
   };
-  /** Whether an EXISTING doc gaining highlights/supplements is enrolled once they land (the original
-   *  "earned new content" rule). An archived Reader doc is not enrolled here — it has its own row —
-   *  and a doc already incremental or DISMISSED in IE is never enrolled, so the row's hint is true. */
-  const enrolOnNewContent = async (rem: PluginRem, externalId: string | null | undefined): Promise<boolean> => {
-    const wanted =
-      ctx.incMode === 'always' || (ctx.incMode === 'readerWhenArchived' && doneStateOf(externalId, ctx) === 'no-signal');
-    return wanted && (await incrementalBlocker(rem)) === undefined;
+  /** Whether an EXISTING doc gaining highlights/supplements is enrolled once they land — the original
+   *  "earned new content" rule, `always` mode only. A doc already incremental or DISMISSED in IE is never
+   *  enrolled, so the row's hint is true. */
+  const enrolOnNewContent = async (rem: PluginRem): Promise<boolean> =>
+    incRule === 'always' && (await incrementalBlocker(rem)) === undefined;
+  /** The event, if any, that makes an EXISTING doc due for enrolment this run (`readerWhenArchived`
+   *  only): this run's done-state against what its stored Location remembers from the last one. A doc
+   *  stored as Archive already — the backlog — has no event, so it is never offered. */
+  const enrolEvent = (state: DoneState, stored: StoredLocation): IncrementalReason | undefined => {
+    if (incRule !== 'readerWhenArchived') return undefined;
+    if (state === 'archived' && stored.kind === 'label' && NON_ARCHIVE_LOCATIONS.has(nameKey(stored.label))) return 'moved';
+    if ((state === 'archived' || state === 'no-signal') && stored.kind === 'empty') return 'first';
+    return undefined;
   };
 
   const toCreateSources: SourceCreateEntry[] = [
@@ -1694,7 +1851,7 @@ export async function computeSyncPlan(
       eligible,
       supplements,
       isSupplementDoc: false,
-      makeIncremental: enrolOnCreate(source),
+      makeIncremental: stage(enrolOnCreate(source), `sc:${source.user_book_id}`),
     })),
     // Supplement documents: the supplemental's highlights are the document's OWN bullets (the whole
     // document is the supplement), so a later merge can move them straight into the main doc.
@@ -1707,9 +1864,9 @@ export async function computeSyncPlan(
       eligible,
       supplements: [] as ReadwiseHighlight[],
       isSupplementDoc: true,
-      // A supplemental is never in Reader (`no-signal`), so a holding doc is enrolled on create exactly
-      // as it always was — in both enrolling modes.
-      makeIncremental: enrolOnCreate(source),
+      // Never enrolled, in either mode: the merge into the main document deletes this doc, and IE's
+      // history for it with it (review finding 9, 2026-11-24). The main document's own rule decides.
+      makeIncremental: false,
     })),
   ];
 
@@ -1721,7 +1878,7 @@ export async function computeSyncPlan(
 
   for (const { es, source, eligible } of existingTouched) {
     touchedRemIds.add(es.rem._id);
-    const changes = await diffSource(plugin, ctx, es, source, existingName.get(es.rem._id));
+    const { changes, storedLocation } = await diffSource(plugin, ctx, es, source, existingName.get(es.rem._id));
     if (changes.length) toUpdateSources.push({ id: `su:${es.rem._id}`, name: es.name, rem: es.rem, source, changes });
     const newHls = eligible.filter((h) => !es.ledger.has(String(h.id)));
     if (newHls.length)
@@ -1731,29 +1888,35 @@ export async function computeSyncPlan(
         name: es.name,
         rem: es.rem,
         highlights: newHls,
-        makeIncremental: await enrolOnNewContent(es.rem, source.external_id),
+        makeIncremental: stage(await enrolOnNewContent(es.rem), es.rem._id),
       });
-    // Done = archived in Reader. STATE-driven, not a one-off event: every archived doc that is neither
-    // incremental nor dismissed in IE is offered, so a row the user unticks — or an enrolment that
-    // failed — comes back next run like any other row, and a doc archived while the option was off is
-    // still picked up. The `dismissed` check is what keeps a doc the user finished in IE from coming
-    // back. Only docs Readwise returned and the filters let through are considered — an excluded or
-    // Readwise-deleted source is not this sync's business (its Location still updates, below).
+    // Done = archived in Reader, and enrolment is an EVENT (the user's rule, 2026-11-25): the move into
+    // the Archive since the last sync, read off the doc's stored Location — or a first-sync enrolment
+    // that never happened (Location still empty). Once the new Location is written the move is used up,
+    // which is what keeps a doc the user took out of IE (by any means — "Remove from Incremental Queue"
+    // does not dismiss) from being offered again, and the backlog of docs archived long ago from being
+    // offered at all. The apply writes that Location only AFTER the enrolment worked, so a failed one
+    // comes back; an unticked row lets the update row record the move — "not this one". The
+    // `dismissed` check still stops a doc the user finished in IE. Only docs Readwise returned and the
+    // filters let through are considered: an excluded or Readwise-deleted source is not this sync's
+    // business (its Location still updates, in the untouched pass below — so its move is used up too).
     let enrol = false;
-    if (ctx.incMode === 'readerWhenArchived' && doneStateOf(source.external_id, ctx) === 'archived') {
+    const reason = enrolEvent(doneStateOf(source.external_id, ctx), storedLocation);
+    if (reason) {
       const blocker = await incrementalBlocker(es.rem);
       if (blocker === 'unreadable')
         log?.log('plan', `  could not read whether "${es.name}" is already incremental — not offered this run.`);
-      enrol = blocker === undefined;
-      if (enrol) toMakeIncremental.push({ id: `mi:${es.rem._id}`, name: es.name, rem: es.rem });
+      enrol = stage(blocker === undefined, es.rem._id);
+      if (enrol) toMakeIncremental.push({ id: `mi:${es.rem._id}`, name: es.name, rem: es.rem, reason });
     }
     if (!changes.length && !newHls.length && !supplementsByRemId.has(es.rem._id) && !enrol)
       alreadyInSync.push({ id: `k:${es.rem._id}`, name: es.name });
     await yieldToHost(); // the repair pass added slot reads per source; keep the iframe breathing
   }
 
-  // A supplement document still waiting for its main source gains its new highlights as ordinary
-  // bullets (it is never in `existingTouched`, so these ids can't clash).
+  // A supplement document gains its new highlights as ordinary bullets — one still waiting for its main
+  // source, or one whose fold is staged this run (it is never in `existingTouched`, so these ids can't
+  // clash). Never enrolled: the fold deletes it sooner or later (review finding 9, 2026-11-24).
   for (const { es, highlights } of supplementDocAdds.values())
     toAddHighlights.push({
       id: `ha:${es.rem._id}`,
@@ -1761,20 +1924,17 @@ export async function computeSyncPlan(
       name: es.name,
       rem: es.rem,
       highlights,
-      makeIncremental: await enrolOnNewContent(es.rem, es.externalId),
+      makeIncremental: false,
     });
 
   const toAddSupplements: SupplementAddEntry[] = [];
   for (const { es, highlights } of supplementsByRemId.values()) {
-    // The MAIN doc's own source decides: what Readwise returned for it this run (a null `external_id`
-    // there is an answer too — not in Reader), else the id stored on the doc.
-    const fetched = fetchedByRem.get(es.rem._id);
     toAddSupplements.push({
       id: `hs:${es.rem._id}`,
       name: es.name,
       rem: es.rem,
       highlights,
-      makeIncremental: await enrolOnNewContent(es.rem, fetched ? fetched.external_id : es.externalId),
+      makeIncremental: stage(await enrolOnNewContent(es.rem), es.rem._id),
     });
   }
 
@@ -1807,10 +1967,12 @@ export async function computeSyncPlan(
       `${toAddHighlights.reduce((n, g) => n + g.highlights.length, 0)} highlight(s) to add, ` +
       `${toAddSupplements.reduce((n, g) => n + g.highlights.length, 0)} supplement(s) to add, ` +
       `${toMergeSupplementDocs.length} supplement doc(s) to merge, ${toFoldLookupDuplicates.length} duplicate lookup rem(s), ` +
-      `${toMakeIncremental.length} archived doc(s) to make incremental ` +
-      `(+${toCreateSources.filter((e) => e.makeIncremental).length} on create, ` +
-      `+${new Set([...toAddHighlights, ...toAddSupplements].filter((e) => e.makeIncremental).map((e) => e.rem._id)).size} with new content), ` +
-      `${alreadyInSync.length} in sync.`
+      `${toMakeIncremental.length} existing doc(s) to make incremental ` +
+      `(${toMakeIncremental.filter((e) => e.reason === 'moved').length} moved into the Archive), ` +
+      `+${toCreateSources.filter((e) => e.makeIncremental).length} on create, ` +
+      `+${new Set([...toAddHighlights, ...toAddSupplements].filter((e) => e.makeIncremental).map((e) => e.rem._id)).size} with new content, ` +
+      `${alreadyInSync.length} in sync.` +
+      (ieMissing ? ` Incremental Everything is not running: ${missed.size} doc(s) NOT enrolled that otherwise would be.` : '')
   );
   return {
     toCreateSources,
@@ -1821,6 +1983,7 @@ export async function computeSyncPlan(
     toFoldLookupDuplicates,
     toMakeIncremental,
     incMode: ctx.incMode,
+    incMissed: ieMissing ? missed.size : undefined,
     alreadyInSync,
     fetchedSources: sources.length,
     matchingHighlights,
@@ -1888,7 +2051,7 @@ async function applyUpdate(
   // derived from this slot, so letting it drift makes the name-parsing fallback in the scan compound an
   // old author into the title.
   if (source) await setProp(rem, SOURCE_SLOTS.baseTitle, [baseTitleOf(source)]);
-  await setProp(rem, SOURCE_SLOTS.lastSyncedAt, [String(syncedAt)]);
+  await stampSyncedAt(rem, syncedAt);
 }
 
 /** Create one source doc + its eligible highlights; ledger holds only the highlights that succeeded.
@@ -1927,9 +2090,13 @@ async function createSourceDoc(
     await writeAuthor(plugin, ctx, rem, (s.author ?? '').trim());
     await writeCategory(plugin, ctx, rem, categoryLabelOf(s));
     // An unknown location (Reader sweep incomplete this run) is left EMPTY so the next complete
-    // sweep's diff fills it in — it is never asserted as "Not in Reader".
+    // sweep's diff fills it in — it is never asserted as "Not in Reader". In `readerWhenArchived` mode a
+    // doc enrolled at its first sync gets its Location only once that enrolment has been carried out
+    // (below): the Location is what tells later syncs where the doc was, so an empty one is how a
+    // failed first-sync enrolment is offered again (`IncrementalReason` 'first').
     const loc = desiredLocation(s, ctx);
-    if (loc.known) await writeLocation(plugin, ctx, rem, loc.label);
+    const holdLocation = entry.makeIncremental && ctx.incMode === 'readerWhenArchived';
+    if (loc.known && !holdLocation) await writeLocation(plugin, ctx, rem, loc.label);
     await writeLink(plugin, rem, linkOf(s, ctx));
     await writeReadwiseUrls(plugin, rem, readwiseUrlsOf(s, ctx));
     await writeCover(plugin, rem, (s.cover_image_url ?? '').trim());
@@ -2001,27 +2168,65 @@ async function createSourceDoc(
       }
     }
     await writeLedger(rem, added, log);
-    await setProp(rem, SOURCE_SLOTS.lastSyncedAt, [String(syncedAt)]);
+    await stampSyncedAt(rem, syncedAt, log);
     // Decided at plan time (and shown on the row): every create in `always` mode; in
     // `readerWhenArchived` mode all but a Reader source still being read (or one the sweep missed).
-    // Never throws — the doc is complete either way.
-    const enrolled = entry.makeIncremental ? await makeIncremental(plugin, rem, ctx, log) : false;
+    // Never fails the row — the doc is complete either way.
+    let enrolled = false;
+    if (holdLocation) {
+      let settled = false;
+      try {
+        enrolled = await enrolIncremental(plugin, rem, ctx, log);
+        settled = true;
+      } catch (err) {
+        log?.log(
+          'apply',
+          `  could not make "${entry.name}" incremental (${errMsg(err)}) — its Location is left empty, so the next sync offers it again.`
+        );
+      }
+      if (settled && loc.known) {
+        try {
+          await writeLocation(plugin, ctx, rem, loc.label);
+        } catch (err) {
+          log?.log('apply', `  Location not written (${errMsg(err)}) — the next sync fills it in.`);
+        }
+      }
+    } else if (entry.makeIncremental) enrolled = await makeIncremental(plugin, rem, ctx, log);
     return { hlFailed, enrolled };
   } catch (err) {
-    try {
-      // remove() DOES cascade inside the manifest's delete scope — verified 2026-09-05 by removing a
-      // real source document: its highlight bullet, that bullet's note child and all seven property
-      // rems were gone afterwards. (An earlier note here claimed the opposite; that probe had used a
-      // TOP-LEVEL rem, which the plugin is not permitted to delete at all, so the parent survived and
-      // its intact child was misread as an orphan.) The doc is under Sources/ by this point, so one
-      // remove() takes the half-built tree with it.
-      await rem.remove();
-      log?.log('apply', `  rolled back the half-created doc for "${entry.name}" — the create will retry next run.`);
-    } catch (rmErr) {
-      // Couldn't remove it. If it already holds copied highlights, record them so the next run adds
-      // only what's missing instead of duplicating every highlight.
-      if (added.size) await writeLedger(rem, added, log).catch(() => undefined);
-      log?.log('apply', `  could NOT roll back the half-created doc for "${entry.name}" (${errMsg(rmErr)}) — it may linger (under Sources/ if it got that far, otherwise as a stray top-level rem); delete it by hand.`);
+    // Once highlights have landed, KEEP the doc whenever its ledger can be written (review finding,
+    // 2026-11-24). Rolling back threw away finished work — a late throw (the Supplements header, say)
+    // deleted a complete book — and one remove() of a big doc raises RemNote's "type 'delete' to
+    // confirm" dialog, which a plugin cannot answer: the call HANGS, and so does the apply. The doc has
+    // its identity already (written before any highlight), so the next sync finds it and adds only what
+    // its ledger lacks. If the ledger itself cannot be written, a SMALL doc is still rolled back — far
+    // below that dialog, and keeping it would re-copy every highlight next run — while a big one is kept
+    // anyway: its last checkpoint bounds the re-copy to LEDGER_CHECKPOINT − 1 highlights.
+    let keep = false;
+    if (added.size) {
+      try {
+        await writeLedger(rem, added, log);
+        keep = true;
+      } catch {
+        keep = added.size >= LEDGER_CHECKPOINT;
+      }
+    }
+    if (keep) {
+      log?.log('apply', `  kept the doc for "${entry.name}" (${added.size} highlight(s) already copied) — the next sync adds what is missing.`);
+    } else {
+      try {
+        // Nothing copied yet (or only a few, unrecorded): the doc is small — properties, body bullets and
+        // under LEDGER_CHECKPOINT highlights — so one remove() is safe.
+        // remove() DOES cascade inside the manifest's delete scope — verified 2026-09-05 by removing a
+        // real source document: its highlight bullet, that bullet's note child and all seven property
+        // rems were gone afterwards. (An earlier note here claimed the opposite; that probe had used a
+        // TOP-LEVEL rem, which the plugin is not permitted to delete at all, so the parent survived and
+        // its intact child was misread as an orphan.)
+        await rem.remove();
+        log?.log('apply', `  rolled back the half-created doc for "${entry.name}" — the create will retry next run.`);
+      } catch (rmErr) {
+        log?.log('apply', `  could NOT roll back the half-created doc for "${entry.name}" (${errMsg(rmErr)}) — it may linger (under Sources/ if it got that far, otherwise as a stray top-level rem); delete it by hand.`);
+      }
     }
     throw err;
   }
@@ -2073,7 +2278,7 @@ async function applyAddHighlights(
     log?.log('apply', `  WARNING: the ledger for this source could not be written (${errMsg(err)}); up to ${sinceCheckpoint} just-added highlight(s) are unrecorded and would be re-added (duplicated) next run — delete the last ${sinceCheckpoint} bullet(s) first, or re-run and remove the duplicates.`);
     throw err;
   }
-  await setProp(rem, SOURCE_SLOTS.lastSyncedAt, [String(syncedAt)]);
+  await stampSyncedAt(rem, syncedAt, log);
   return { added, failed };
 }
 
@@ -2123,7 +2328,7 @@ async function applyAddSupplements(
     log?.log('apply', `  WARNING: the ledger for this source could not be written (${errMsg(err)}); up to ${sinceCheckpoint} just-added supplement(s) are unrecorded and would be re-added (duplicated) next run — delete the last ${sinceCheckpoint} bullet(s) under Supplements first.`);
     throw err;
   }
-  await setProp(rem, SOURCE_SLOTS.lastSyncedAt, [String(syncedAt)]);
+  await stampSyncedAt(rem, syncedAt, log);
   return { added, failed };
 }
 
@@ -2200,7 +2405,22 @@ export async function applySyncPlan(
   }
 
 
-  for (const { entry, fields } of selection.toUpdateSources) {
+  // A doc with a TICKED make-incremental row has its Location written by THAT row, after the enrolment
+  // worked — the stored Location is what tells the next sync whether the doc has moved into the
+  // Archive, so writing it first would use the move up even if the enrolment then failed. Unticked, the
+  // update row records the move as usual: "not this one". `?? []`: see the make-incremental loop.
+  const enrolRemIds = new Set((selection.toMakeIncremental ?? []).map((e) => e.rem._id));
+  /** remId → the update row whose Location the make-incremental row writes; `alone` = that was the
+   *  row's only ticked field, so the row's ✅/❌ waits for the outcome of that write. */
+  const heldLocation = new Map<string, { entry: SourceUpdateEntry; alone: boolean }>();
+  for (const { entry, fields: picked } of selection.toUpdateSources) {
+    let fields = picked;
+    if (enrolRemIds.has(entry.rem._id) && fields.has('location')) {
+      fields = new Set(fields);
+      fields.delete('location');
+      heldLocation.set(entry.rem._id, { entry, alone: fields.size === 0 });
+      if (!fields.size) continue;
+    }
     try {
       await applyUpdate(plugin, ctx, entry, fields, syncedAt);
       updated += 1;
@@ -2220,9 +2440,9 @@ export async function applySyncPlan(
       highlightsAdded += added;
       highlightsFailed += hlFailed;
       // The original "earned new content" rule, decided at plan time (`entry.makeIncremental`): an
-      // existing source that just gained ≥1 highlight gets enrolled — every one in `always` mode, only
-      // one with no "done" signal in `readerWhenArchived` mode. makeIncremental re-checks for a doc
-      // already incremental or dismissed, and never throws.
+      // existing source that just gained ≥1 highlight gets enrolled — `always` mode only (a
+      // `readerWhenArchived` doc is enrolled once, at its first sync or on its move into the Archive).
+      // makeIncremental re-checks for a doc already incremental or dismissed, and never throws.
       if (added > 0 && entry.makeIncremental && (await makeIncremental(plugin, entry.rem, ctx, log))) madeIncremental += 1;
       onItemDone(entry.id, true);
     } catch (err) {
@@ -2283,18 +2503,48 @@ export async function applySyncPlan(
     await yieldToHost();
   }
 
-  // Enrol archived docs LAST, once every row above has finished writing them: a doc enters the
-  // Incremental Everything queue complete, with this run's highlights and its new Location. `?? []`
-  // keeps a caller that predates this field (the test suite's selection builders) working.
+  // Enrol LAST, once every row above has finished writing the docs: a doc enters the Incremental
+  // Everything queue complete, with this run's highlights. Its new Location — held back from its update
+  // row, above — is written only once the enrolment is settled (done, or not needed: already
+  // incremental or dismissed), so a failed enrolment leaves the old one and the next sync offers the
+  // same move again. `?? []` keeps a caller that predates this field (the test suite's selection
+  // builders) working.
   for (const entry of selection.toMakeIncremental ?? []) {
     try {
-      log?.log('apply', `Making "${entry.name}" incremental (archived in Reader).`);
+      log?.log(
+        'apply',
+        `Making "${entry.name}" incremental (${entry.reason === 'moved' ? 'moved into the Archive' : 'not enrolled at its first sync'}).`
+      );
       if (await enrolIncremental(plugin, entry.rem, ctx, log)) madeIncremental += 1;
       onItemDone(entry.id, true);
     } catch (err) {
       failed += 1;
-      log?.log('apply', `MAKE-INCREMENTAL FAILED for ${entry.name}: ${errMsg(err)}`);
+      const held = heldLocation.get(entry.rem._id);
+      log?.log(
+        'apply',
+        `MAKE-INCREMENTAL FAILED for ${entry.name}: ${errMsg(err)}` +
+          (held ? ' — its Location was left as it was, so the next sync offers it again.' : '')
+      );
       onItemDone(entry.id, false);
+      if (held?.alone) onItemDone(held.entry.id, false); // its one field was this Location
+      await yieldToHost();
+      continue;
+    }
+    const held = heldLocation.get(entry.rem._id);
+    if (held) {
+      try {
+        await applyUpdate(plugin, ctx, held.entry, new Set<UpdatableField>(['location']), syncedAt);
+        if (held.alone) {
+          updated += 1;
+          onItemDone(held.entry.id, true);
+        }
+      } catch (err) {
+        log?.log('apply', `  enrolled, but its Location could not be written (${errMsg(err)}) — the next sync offers that again.`);
+        if (held.alone) {
+          failed += 1;
+          onItemDone(held.entry.id, false);
+        }
+      }
     }
     await yieldToHost();
   }

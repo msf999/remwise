@@ -16,6 +16,7 @@ import {
   type ApplySelection,
   buildSyncContext,
   computeSyncPlan,
+  type IncrementalReason,
   type SourceCreateEntry,
   type SyncContext,
   type SyncPlan,
@@ -89,8 +90,14 @@ const headerStyle: CSSProperties = {
 };
 const bodyStyle: CSSProperties = { padding: '4px 12px 10px 12px' };
 /** Appended to a create / add row that also enrols its doc in Incremental Everything (decided by the
- *  plan: `makeIncremental` on the entry). An ARCHIVED Reader doc gets its own section instead. */
+ *  plan: `makeIncremental` on the entry). An EXISTING doc enrolled by the default rule — it moved into
+ *  the Archive, or its first-sync enrolment never happened — gets its own section instead. */
 const INC_HINT = ' · will be made Incremental';
+/** Why an existing doc is in the "Will make Incremental" section (`IncrementalEntry.reason`). */
+const INC_REASON: Record<IncrementalReason, string> = {
+  moved: 'moved to the Archive in Reader',
+  first: 'not made Incremental at its first sync — retrying',
+};
 
 /** Select-all state for a section header; omitted for a read-only section. */
 interface SelectAll {
@@ -292,6 +299,17 @@ export const ReadwiseSync = () => {
             `(${p.orphanDocNames.slice(0, 3).join(', ')}${p.orphanDocNames.length > 3 ? ', …' : ''}) — leftovers of an ` +
             'interrupted create. Delete them by hand, or their sources will be imported a second time.'
         );
+      // "Make source docs Incremental" is on but Incremental Everything is not running. Each doc is
+      // enrolled once, on an event (its first sync, its move into the Archive) — and applying records
+      // that event whether or not anything was enrolled, so these would never be offered again.
+      if (p.incMissed !== undefined)
+        warnings.push(
+          p.incMissed > 0
+            ? `Incremental Everything isn't running, so ${p.incMissed} document(s) that should be made Incremental now ` +
+                "won't be — and once you apply, they won't be offered again. To enrol them, enable Incremental " +
+                'Everything, then press Refresh before applying.'
+            : "Incremental Everything isn't running, so nothing will be made Incremental."
+        );
       if (warnings.length) setWarning(warnings.join(' '));
 
       // Default selection: everything actionable is ticked.
@@ -327,7 +345,7 @@ export const ReadwiseSync = () => {
               `${p.toCreateSources.length} to create, ${p.toUpdateSources.length} source update(s), ${hlToAdd} highlight(s)` +
               `${supToAdd ? ` and ${supToAdd} supplement(s)` : ''} to add` +
               `${p.toMergeSupplementDocs.length ? `, ${p.toMergeSupplementDocs.length} supplement document(s) to fold in` : ''}` +
-              `${p.toMakeIncremental.length ? `, ${p.toMakeIncremental.length} archived source(s) to make Incremental` : ''}.`
+              `${p.toMakeIncremental.length ? `, ${p.toMakeIncremental.length} source(s) to make Incremental` : ''}.`
           : p.fetchedSources === 0
             ? 'Readwise returned no sources for this account.'
             : p.matchingHighlights === 0
@@ -691,16 +709,20 @@ export const ReadwiseSync = () => {
             </Section>
 
             <Section
-              title="Will make Incremental (archived in Reader)"
+              title="Will make Incremental"
               count={plan.toMakeIncremental.length}
               {...sectionProps('inc', incLeafIds)}
             >
+              <div style={{ paddingLeft: 16, fontSize: 12, color: '#6b7280' }}>
+                Enrolled in Incremental Everything, due today. Each is offered once: untick one to leave it out, and it
+                won't be offered again.
+              </div>
               {plan.toMakeIncremental.map((e) => (
                 <div key={e.id} style={{ ...rowStyle, paddingLeft: 16 }}>
                   <Check checked={selected.has(e.id)} disabled={busy || applied} onChange={() => toggle(e.id)} />
                   <span>
                     {e.name}
-                    <span style={{ color: '#6b7280' }}> · enrolled in Incremental Everything, due today</span>
+                    <span style={{ color: '#6b7280' }}> · {INC_REASON[e.reason]}</span>
                     {mark(e.id)}
                   </span>
                 </div>

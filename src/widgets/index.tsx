@@ -65,13 +65,13 @@ async function onActivate(plugin: ReactRNPlugin) {
     id: SETTINGS.initIncremental,
     title: 'Make source docs Incremental (Incremental Everything)',
     description:
-      'When ON, Remwise enrols source documents into the Incremental Everything plugin (due today): a new ' +
-      'source as soon as it is created, and an existing one when it gains a new highlight — except that, ' +
-      'by default, a source from Readwise Reader waits until you have archived it there (see the next ' +
-      'setting). Requires that plugin installed; otherwise nothing is enrolled. A document you dismissed ' +
-      'in Incremental Everything is never enrolled again. NOTE: Incremental Everything only notices ' +
-      'newly-enrolled docs after it rebuilds its cache — reload the Incremental Everything plugin (or ' +
-      'RemNote) after a sync for them to enter the queue.',
+      'When ON, Remwise enrols source documents into the Incremental Everything plugin (due today). By ' +
+      'default (see the next setting) each source is enrolled once: when it is first synced, or — a ' +
+      'source you are still reading in Readwise Reader — when you archive it there. Requires that plugin ' +
+      'installed and running; otherwise nothing is enrolled, and the sync preview warns you. A document ' +
+      'you dismissed in Incremental Everything is never enrolled again. NOTE: Incremental Everything only ' +
+      'notices newly-enrolled docs after it rebuilds its cache — reload the Incremental Everything plugin ' +
+      '(or RemNote) after a sync for them to enter the queue.',
     defaultValue: false,
   });
 
@@ -79,12 +79,16 @@ async function onActivate(plugin: ReactRNPlugin) {
     id: SETTINGS.readerOnlyWhenArchived,
     title: '…Reader sources only once archived (done)',
     description:
-      'Applies when "Make source docs Incremental" is ON. When ON (the default), a source from Readwise ' +
-      'Reader is enrolled only once you have finished it, i.e. archived it in Reader; the sync preview ' +
-      'lists each one under "Will make Incremental". Only Reader documents say when they are done, so ' +
-      'every other source (books from Kindle and other e-readers, tweets and podcasts saved outside ' +
-      'Reader, supplementals, manual imports) is enrolled as before: when it is created, or when it gains ' +
-      'a new highlight. When OFF, Reader sources are enrolled that way too.',
+      'Applies when "Make source docs Incremental" is ON. When ON (the default), every source is enrolled ' +
+      'ONCE. A source from Readwise Reader is enrolled when you have finished it, i.e. archived it in ' +
+      'Reader: at its first sync if it is archived already, otherwise at the first sync after you archive ' +
+      'it (listed under "Will make Incremental" in the preview). Every other source (books from Kindle and ' +
+      'other e-readers, tweets and podcasts saved outside Reader, manual imports) has no "done" signal and ' +
+      'is enrolled at its first sync. A document taken out of Incremental Everything is not enrolled ' +
+      'again unless you take it out of the Archive and archive it again. A document that was already ' +
+      'archived at an earlier sync (before you turned this on, say) is never enrolled. When OFF, every ' +
+      'source is enrolled when it is created and again whenever it gains a new highlight. Either way, ' +
+      'a "- Supplement" document is never enrolled.',
     defaultValue: true,
   });
 
@@ -136,7 +140,10 @@ async function onActivate(plugin: ReactRNPlugin) {
     name: 'Sync Readwise',
     quickCode: 'rw',
     action: async () => {
-      await plugin.widget.openPopup(SYNC_WIDGET);
+      // clickOutsideToClose = false: the popup closes only through its own ✕, which is disabled while an
+      // apply runs. A click on the backdrop used to be able to kill the frame mid-apply — a half-written
+      // row and up to LEDGER_CHECKPOINT − 1 duplicate highlights next run (review finding, 2026-11-24).
+      await plugin.widget.openPopup(SYNC_WIDGET, undefined, false);
     },
   });
 

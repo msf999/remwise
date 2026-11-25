@@ -17,7 +17,9 @@ as properties, with its highlights as bullets beneath it.
 > **Add-only — your highlights stay yours.** Once a highlight is in Remnote, Remwise never edits or
 > deletes it: you own it (make flashcards, add notes, rearrange it freely). It only ever *appends* new
 > matching highlights and keeps each source's own metadata in step. Readwise-side highlight edits and
-> deletes do **not** propagate, and nothing in Remnote is ever removed.
+> deletes do **not** propagate, and nothing of yours in Remnote is ever removed: the only deletions are
+> Remwise's own housekeeping (an emptied supplement document once its highlights have moved into the
+> book, or a duplicate Author / Category / Location entry), each one a preview row you can untick.
 
 > [!WARNING]
 > **Vibe-coded — experimental.** Remwise was built largely by prompting an AI assistant, with light
@@ -53,33 +55,45 @@ as properties, with its highlights as bullets beneath it.
   Reader (Inbox / Later / Shortlist / Archive / Feed), kept up to date even when a source only *moves*
   without gaining highlights.
 - **Per-source metadata kept in sync.** If an author / category / location / link or the title changes
-  in Readwise, the preview offers an opt-out *Will update source* row.
-- **Smart, collision-proof titles.** Same-titled sources are disambiguated symmetrically (`Title` →
-  `Title — Author` → `Title — Author — Category` → `… — [id]`), so two books with the same name never
+  in Readwise, the preview offers an opt-out *Will update source* row. It also offers to repair a
+  property that broke inside Remnote (for example one showing "Loading").
+- **Smart, collision-proof titles.** Sources that share an author and title are disambiguated
+  symmetrically (`Author - Title` → `Author - Title — Category` → `… — Category — [id]`), so they never
   clash.
 
 ### Incremental Everything (optional)
 When enabled, source documents are enrolled in the
 [Incremental Everything](https://github.com/bjsi/incremental-everything) plugin (added to its queue, due
-today):
-- **Sources from Readwise Reader** wait until you have **finished** them — i.e. **archived** them in
-  Reader (by default). The preview lists each one under *Will make Incremental (archived in Reader)*,
-  ticked, so you can leave any out (it is offered again on the next sync).
+today) — by default **once per document**, when Remwise sees you have finished it:
+- **Sources from Readwise Reader** are enrolled when you have **archived** them in Reader: at their
+  first sync if they are archived already, otherwise at the first sync after you archive them. The
+  preview lists those under *Will make Incremental*, ticked; untick one to leave it out, and it is not
+  offered again.
 - **Every other source** — books from Kindle and other e-readers, tweets and podcasts saved outside
-  Reader, supplementals, manual imports — is enrolled as soon as it is created, or when it gains a new
-  highlight. Only Reader documents tell Readwise when they are done, so these have nothing to wait for.
-- A document you **dismissed** in Incremental Everything is never enrolled again.
+  Reader, manual imports — is enrolled at its first sync. Only Reader documents tell Readwise when they
+  are done, so these have nothing to wait for.
+- Each document is enrolled **once**: a document you take out of Incremental Everything is not put back
+  (unless you take it out of Reader's Archive and archive it again), and one that was already archived
+  at an earlier sync — before you turned the option on, say — is never enrolled. A document you
+  **dismissed** in Incremental Everything is never enrolled again, and a *- Supplement* holding
+  document is never enrolled at all.
 
-The preview marks every create or add row that will enrol its document (*· will be made Incremental*).
-Turn **…Reader sources only once archived** off to treat Reader sources like the rest. Requires that
-plugin installed; otherwise nothing is enrolled.
+Remwise remembers where each document was through its **Location** property, which it updates only once
+an enrolment has worked — so a failed one is retried on the next sync. The preview marks every create
+row that will enrol its document (*· will be made Incremental*). Turn **…Reader sources only once
+archived** off for the original rule: every source is enrolled when it is created, and again whenever it
+gains a new highlight. Requires that plugin installed and running; otherwise nothing is enrolled, the
+sync still works, and the preview warns you before you apply.
 
 ### Preview-then-apply
 The **Sync Readwise** popup never changes anything until you say so. **Get from Readwise** fetches your
 library and shows the plan grouped into collapsible, selectable categories — *Will create (sources)*
-(grouped by category), *Will update source*, *Will add highlights*, and read-only *Already in sync* —
-with per-row and select-all checkboxes, a live fetch progress bar, then per-item ✅/❌ and a completion
-toast. A collapsible **Log** box (with a copy button) shows the full diagnostic log.
+(grouped by category), *Will update source*, *Will add highlights*, *Will add supplements*, *Will make
+Incremental*, *Will merge supplement documents into their source*, *Will fold
+duplicate Author / Category / Location rems*, and read-only *Already in sync* — each shown only when it
+has something in it, with per-row and select-all checkboxes, a live fetch progress bar, then per-item
+✅/❌ and a completion toast. A collapsible **Log** box (with a copy button) shows the full diagnostic
+log.
 
 ---
 
@@ -99,7 +113,8 @@ Readwise/
 │  ├─ Books
 │  ├─ Articles
 │  ├─ Tweets
-│  └─ Podcasts
+│  ├─ Podcasts
+│  └─ Supplementals       ← only for a `… - Supplement` document waiting for its book
 ├─ Authors/               — one rem per author
 │  ├─ James Clear
 │  └─ …
@@ -129,11 +144,12 @@ Beneath the properties sit the source's summary / document note (written once, o
 **highlights** (each a plain bullet: the highlighted text + a 📌 link back to Readwise + an optional
 note child), and finally a **Supplements** heading holding Readwise's curated popular highlights for
 that source, if it has any. Each source also carries hidden bookkeeping slots — Readwise Book ID, Base Title, Reader Doc
-ID, the synced-highlight ledger, and Last Synced — that track sync identity; they aren't shown.
+ID, the raw Link URL, the synced-highlight ledger, and Last Synced — that track sync identity; they
+aren't shown.
 
 Because **Author / Category / Location are references** into the shared lookup docs, those docs double
 as automatic indexes — open *Authors → "James Clear"* and Remnote's references panel lists every source
-by him.
+by that author.
 
 > [!TIP]
 > The **Tags** property is yours to fill — it works best as a **Multi Select**. If it shows as plain
@@ -146,14 +162,14 @@ by him.
 
 1. Open **[readwise.io/access_token](https://readwise.io/access_token)** (signed in to Readwise) and
    copy your **access token**. A read-only token is fine — Remwise only ever *reads* from Readwise.
-2. In Remnote, open the plugin's settings (**Settings → Plugins → Remwise**, or the **Build** tab while
-   developing from localhost) and paste it into **Readwise access token**. Optionally set **Tags to
-   copy** — a comma-separated list of the tags you want imported.
+2. In Remnote, open the plugin's settings (**Settings → Plugin Settings**, the **Remwise** section) and
+   paste it into **Readwise access token**. Optionally set **Tags to copy** — a comma-separated list of
+   the tags you want imported.
 3. **Type `/` anywhere** and run **Sync Readwise** (or use the quick code `rw`) to open the popup →
    **Get from Readwise** to preview, then **Apply changes** for the rows you tick.
 
-> Remwise opens straight into a preview and **checks your token when the popup opens**, telling you if
-> it's missing or invalid — so nothing fails mid-fetch.
+> Remwise **checks your token as soon as the popup opens**, telling you if it's missing or invalid — so
+> nothing fails mid-fetch.
 
 ## Settings
 
@@ -163,10 +179,11 @@ by him.
 | **Tags to copy (comma-separated)** | _(empty)_ | Copy highlights carrying one of these tags (case-insensitive); if a SOURCE itself carries the tag, ALL of its highlights are copied. Empty = copy every highlight. Tip: start with a single tag (e.g. `science`) to see how it looks. |
 | **Apply highlight colors** | Off | On = each highlight's Readwise color (yellow / blue / pink / orange / green / purple) is applied as a Remnote highlight color. Off = highlights import as plain text. |
 | **Include Books / Articles / Tweets / Podcasts / Supplementals** | On (each) | Five toggles — include each Readwise category when syncing. Turn all five off and nothing syncs (the popup tells you so). *Supplementals* adds curated popular highlights to the **Supplements** section of the matching source, not a document of its own. |
-| **Make source docs Incremental** | Off | Enrol source documents into [Incremental Everything](https://github.com/bjsi/incremental-everything) (due today): a new source when it is created, and an existing one when it gains a new highlight — except Reader sources, by default (next setting). A document you dismissed there is never enrolled again. Requires that plugin (otherwise nothing is enrolled). Reload Incremental Everything (or Remnote) after a sync for enrolled docs to enter the queue. |
-| **…Reader sources only once archived (done)** | On | On = a source from Readwise Reader is enrolled only once you have archived it there (listed under *Will make Incremental* in the preview). Every other source has no "done" signal and is enrolled as above. Off = Reader sources are enrolled as above too. |
+| **Make source docs Incremental** | Off | Enrol source documents into [Incremental Everything](https://github.com/bjsi/incremental-everything) (due today) — by default once per document, when it is first synced or (a Reader source you are still reading) when you archive it; see the next setting. A document you dismissed there is never enrolled again, and a *- Supplement* document never is. Requires that plugin running (otherwise nothing is enrolled, and the preview warns you). Reload Incremental Everything (or Remnote) after a sync for enrolled docs to enter the queue. |
+| **…Reader sources only once archived (done)** | On | On = each source is enrolled once: a Readwise Reader source when you have archived it there (at its first sync if it already is, else at the first sync after you archive it — listed under *Will make Incremental* in the preview); every other source, which has no "done" signal, at its first sync. A document taken out of Incremental Everything is not put back unless you archive it again, and one already archived at an earlier sync is never enrolled. Off = the original rule: every source when it is created, and again whenever it gains a new highlight. |
 
 > [!NOTE]
-> Every sync re-checks your **whole** Readwise library (one export call, plus a throttled sweep of your
-> Reader documents for their locations). Already-synced items stay _Already in sync_ — nothing is ever
-> re-imported or duplicated, so applying a few rows at a time is always safe.
+> Every sync re-checks your **whole** Readwise library (the full export, plus a sweep of your Reader
+> documents for their locations, throttled to Readwise's rate limit — a few minutes for a big Reader
+> library). Already-synced items stay _Already in sync_ — nothing is ever re-imported or duplicated,
+> so applying a few rows at a time is always safe.

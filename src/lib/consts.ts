@@ -14,10 +14,11 @@ export const SETTINGS = {
    */
   initIncremental: 'init-incremental-on-create',
   /**
-   * Default ON. Narrows `initIncremental` for READER sources: one is enrolled only once it is DONE —
-   * archived in Readwise Reader. Every other source keeps the original rule (enrolled on create, or when
-   * it gains a new highlight), because only Reader documents carry a "done" signal: the v2 export has no
-   * finished/read flag at all (the user's choice, 2026-11-24). OFF = the original rule for every source.
+   * Default ON. Each source is enrolled ONCE, on an event (the user's rule, 2026-11-25): a READER source
+   * when it is DONE — archived in Readwise Reader — at its first sync if it already is, else at the sync
+   * that sees it move into the Archive; every other source at its first sync, because only Reader
+   * documents carry a "done" signal (the v2 export has no finished/read flag at all — the user's choice,
+   * 2026-11-24). OFF = the original rule for every source: on create, and whenever it gains a highlight.
    */
   readerOnlyWhenArchived: 'incremental-reader-only-when-archived',
 } as const;
@@ -41,10 +42,13 @@ export const categorySettingId = (c: Category): string => `readwise-cat-${c}`;
 /**
  * Incremental Everything (IE) integration. IE marks a rem "incremental" via its `incremental` powerup
  * + slots; the SDK has no cross-plugin command API, so we replicate IE's `initIncrementalRem` tagging
- * directly (see `makeIncremental` in sync.ts). These codes mirror IE's own consts (verified against
- * the IE source) — keep in sync if IE renames them. We write the SAME slots IE writes so an
- * enrolled rem is byte-identical to an IE-native one (nextRepDate/originalIncDate/firstAdded = today's
- * daily-doc ref; priority + rotation as a one-string array; repHist = a `madeIncremental` marker).
+ * directly (see `enrolIncremental` in sync.ts). These codes mirror IE's own consts (verified against
+ * the IE source) — keep in sync if IE renames them. We write the SAME slots IE writes
+ * (nextRepDate/originalIncDate/firstAdded = today's daily-doc ref; priority + rotation as a one-string
+ * array; repHist = a `madeIncremental` marker), but NOT the same values IE would choose: IE takes its
+ * default priority from its own settings and dates the first review today + its Initial Interval, and
+ * a plugin cannot read another plugin's settings — so Remwise uses 10 (or an incremental parent's
+ * priority) and today (review finding, 2026-11-24).
  * NOTE: IE only DETECTS a newly-tagged rem when it rebuilds its in-session cache, which happens on IE
  * plugin/app load — so after a sync that enrols docs, the IE plugin (or RemNote) must reload for them
  * to enter the queue (IE's live cache updates are internal and unreachable from another plugin).

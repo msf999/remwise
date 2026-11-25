@@ -85,10 +85,10 @@ async function onActivate(plugin: ReactRNPlugin) {
       'it (listed under "Will make Incremental" in the preview). Every other source (books from Kindle and ' +
       'other e-readers, tweets and podcasts saved outside Reader, manual imports) has no "done" signal and ' +
       'is enrolled at its first sync. A document taken out of Incremental Everything is not enrolled ' +
-      'again unless you take it out of the Archive and archive it again. A document that was already ' +
-      'archived at an earlier sync (before you turned this on, say) is never enrolled. When OFF, every ' +
-      'source is enrolled when it is created and again whenever it gains a new highlight. Either way, ' +
-      'a "- Supplement" document is never enrolled.',
+      'again unless a sync sees it out of the Archive and a later one sees it archived again. A document ' +
+      'synced while "Make source docs Incremental" was off is enrolled only if a later sync sees it move ' +
+      "into Reader's Archive. When OFF, every source is enrolled when it is created and again whenever " +
+      'it gains a new highlight. Either way, a "- Supplement" document is never enrolled.',
     defaultValue: true,
   });
 

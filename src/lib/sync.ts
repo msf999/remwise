@@ -172,8 +172,8 @@ export interface KeptEntry {
 export type IncrementalMode = 'off' | 'always' | 'readerWhenArchived';
 
 /** Why an EXISTING doc is offered a `toMakeIncremental` row (`readerWhenArchived` mode only):
- *  - `moved` — its stored Location is a non-Archive place and Reader now has it in the Archive: the
- *              user finished it since the last sync.
+ *  - `moved` — its stored Location is a Reader place other than the Archive (`NON_ARCHIVE_LOCATIONS`)
+ *              and Reader now has it in the Archive: the user finished it since the last sync.
  *  - `first` — its stored Location is still EMPTY although its first-sync rule says "enrol" (archived,
  *              or no "done" signal): that first-sync enrolment never happened — it failed, the apply
  *              was cut short, or the sweep could not place the doc then. The Location is written only
@@ -189,16 +189,17 @@ type StoredLocation =
   | { kind: 'broken' } // a reference to a deleted lookup rem
   | { kind: 'unreadable' }; // the read failed, or the location is unknown this run
 
-/** The Location labels that mean "somewhere other than the Archive": a doc stored with one of these and
- *  archived in Reader now has MOVED into the Archive. Anything else (a renamed lookup rem, say) is not
- *  recognised and makes no move. */
+/** The Location labels that mean "somewhere in Reader other than the Archive": a doc stored with one of
+ *  these and archived in Reader now has MOVED into the Archive. Anything else (a renamed lookup rem, say)
+ *  is not recognised and makes no move. "Not in Reader" is deliberately NOT one (review finding 1,
+ *  2026-11-25): in the user's rule a source whose location "doesn't support archive" is settled at its
+ *  first sync, so it has no move to make — and v0.1.1 stored "Not in Reader" for every Reader source
+ *  its sweep had not reached (a sweep that stopped early, or Quick sync's `updatedAfter`), so counting
+ *  it would offer that whole archived backlog at the first sync after an upgrade. */
 const NON_ARCHIVE_LOCATIONS = new Set(
-  [
-    ...Object.entries(LOCATION_LABEL)
-      .filter(([value]) => value !== READER_ARCHIVE)
-      .map(([, label]) => label),
-    NOT_IN_READER,
-  ].map((label) => nameKey(label)) // a function declaration below — hoisted, so callable here
+  Object.entries(LOCATION_LABEL)
+    .filter(([value]) => value !== READER_ARCHIVE)
+    .map(([, label]) => nameKey(label)) // a function declaration below — hoisted, so callable here
 );
 
 /** What this run knows about whether the user has finished a source. Mirrors the Location property:
@@ -222,6 +223,10 @@ export interface IncrementalEntry {
   name: string;
   rem: PluginRem;
   reason: IncrementalReason;
+  /** The Location label this row records once the enrolment is settled — the memory that uses the event
+   *  up. Written by THIS row, whether or not the doc's update row (which stages the same change) is
+   *  ticked (review finding 4, 2026-11-25). */
+  location: string;
 }
 
 /** The full set of changes a sync would make (add-only). */
@@ -706,9 +711,26 @@ function parseLedger(raw: string, log?: SyncLog): Set<string> {
 
 const serializeLedger = (ids: Set<string>): RichTextInterface => [JSON.stringify([...ids])];
 
-/** Checkpoint the ledger every N added highlights, so a failure late in a long row leaves at most N-1
- *  copied-but-unrecorded highlights (the one thing that can produce duplicates on the next run). */
+/** Checkpoint the ledger every N added highlights, so a failure late in a long row leaves at most N
+ *  copied-but-unrecorded highlights (the one thing that can produce duplicates on the next run). A
+ *  checkpoint that fails STOPS the row (review finding 3, 2026-11-25): carrying on while checkpoints
+ *  fail let that tail grow without bound — hundreds of highlights copied twice. */
 const LEDGER_CHECKPOINT = 5;
+
+/** A ledger checkpoint failed (after `writeLedger`'s own retry) in an add loop: the row stops there, so
+ *  no more than LEDGER_CHECKPOINT highlights go unrecorded. Returns how many it did not attempt — counted
+ *  as failed, so the toast says the next sync retries them. */
+function stopAfterFailedCheckpoint(
+  highlights: ReadwiseHighlight[],
+  i: number,
+  ledger: Set<string>,
+  err: unknown,
+  log?: SyncLog
+): number {
+  const rest = highlights.slice(i + 1).filter((x) => !ledger.has(String(x.id))).length;
+  log?.log('apply', `  ledger checkpoint failed (${errMsg(err)}) — stopping this source here; the next sync adds the other ${rest}.`);
+  return rest;
+}
 
 /** Read a slot WITHOUT swallowing failures. An UNSET slot legitimately comes back undefined/null and
  *  must read as '' — only a genuine read error may throw, so the caller can retry or fail loudly.
@@ -1359,13 +1381,19 @@ async function enrolIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncConte
  *  `always` mode: enrolment is secondary to what that row does, so a failure is logged and never fails
  *  the row; such a doc is retried the next time it gains a highlight, as it always was. (A create in
  *  `readerWhenArchived` mode calls `enrolIncremental` itself, holding the Location back until it has
- *  worked — see `createSourceDoc`.) Returns true when it enrolled the doc. */
-async function makeIncremental(plugin: RNPlugin, rem: PluginRem, ctx: SyncContext, log?: SyncLog): Promise<boolean> {
+ *  worked — see `createSourceDoc`.) A 'failed' one is counted for the completion toast (`enrolFailed`),
+ *  since the row itself shows ✅ (review finding 6, 2026-11-25). */
+async function makeIncremental(
+  plugin: RNPlugin,
+  rem: PluginRem,
+  ctx: SyncContext,
+  log?: SyncLog
+): Promise<'enrolled' | 'not-needed' | 'failed'> {
   try {
-    return await enrolIncremental(plugin, rem, ctx, log);
+    return (await enrolIncremental(plugin, rem, ctx, log)) ? 'enrolled' : 'not-needed';
   } catch (err) {
     log?.log('apply', `Incremental-init failed (non-fatal): ${errMsg(err)}`);
-    return false;
+    return 'failed';
   }
 }
 
@@ -1407,13 +1435,18 @@ async function diffSource(
   let storedLocation: StoredLocation = { kind: 'unreadable' };
   if (loc.known) {
     locRt = await getSlotRichText(es.rem, SOURCE_SLOTS.location);
-    const curLoc = await slotToComparable(plugin, ctx.refNameCache, locRt);
-    if (nameKey(curLoc) !== nameKey(loc.label))
-      changes.push({ field: 'location', fromDisplay: displayValue(curLoc), toDisplay: displayValue(loc.label) });
-    // Structural verdict, once, for both the repair below and the stored-Location reading. With no
-    // `locRt` (unset, or a read `getSlotRichText` swallowed) `slotHealth` re-reads STRICTLY, so a failed
-    // read comes back 'unknown' — never 'empty', which would look like an unfinished first sync.
+    // Structural verdict, once, for the value diff, the repair below and the stored-Location reading.
+    // With no `locRt` (unset, or a read `getSlotRichText` swallowed) `slotHealth` re-reads STRICTLY, so a
+    // failed read comes back 'unknown' — never 'empty', which would look like an unfinished first sync.
     locHealth = await slotHealth(plugin, ctx.refNameCache, es.rem, SOURCE_SLOTS.location, { wantNonEmpty: true, els: locRt });
+    const curLoc = await slotToComparable(plugin, ctx.refNameCache, locRt);
+    // Compare only a value that was actually READ (review finding 2, 2026-11-25). A swallowed failure
+    // reads as '', and staging "(empty) → Archive" off it would write the Location while
+    // `storedLocation` below says 'unreadable' — using up a move into the Archive (or a first-sync retry)
+    // that this run could not see. An unset slot reads strictly as 'empty' and is still compared; a
+    // dangling one the first read missed is left to the repair pass.
+    if ((locRt !== undefined || locHealth === 'empty') && nameKey(curLoc) !== nameKey(loc.label))
+      changes.push({ field: 'location', fromDisplay: displayValue(curLoc), toDisplay: displayValue(loc.label) });
     storedLocation =
       locHealth === 'dangling'
         ? { kind: 'broken' }
@@ -1878,8 +1911,7 @@ export async function computeSyncPlan(
 
   for (const { es, source, eligible } of existingTouched) {
     touchedRemIds.add(es.rem._id);
-    const { changes, storedLocation } = await diffSource(plugin, ctx, es, source, existingName.get(es.rem._id));
-    if (changes.length) toUpdateSources.push({ id: `su:${es.rem._id}`, name: es.name, rem: es.rem, source, changes });
+    const { changes: diffed, storedLocation } = await diffSource(plugin, ctx, es, source, existingName.get(es.rem._id));
     const newHls = eligible.filter((h) => !es.ledger.has(String(h.id)));
     if (newHls.length)
       toAddHighlights.push({
@@ -1895,20 +1927,29 @@ export async function computeSyncPlan(
     // that never happened (Location still empty). Once the new Location is written the move is used up,
     // which is what keeps a doc the user took out of IE (by any means — "Remove from Incremental Queue"
     // does not dismiss) from being offered again, and the backlog of docs archived long ago from being
-    // offered at all. The apply writes that Location only AFTER the enrolment worked, so a failed one
-    // comes back; an unticked row lets the update row record the move — "not this one". The
-    // `dismissed` check still stops a doc the user finished in IE. Only docs Readwise returned and the
-    // filters let through are considered: an excluded or Readwise-deleted source is not this sync's
-    // business (its Location still updates, in the untouched pass below — so its move is used up too).
+    // offered at all. The make-incremental row writes that Location itself, and only AFTER the
+    // enrolment worked, so a failed one comes back; unticked, it leaves the Location to the update
+    // row, which records the move — "not this one". The `dismissed` check still stops a doc the user
+    // finished in IE. Only docs Readwise returned and the filters let through are considered: an
+    // excluded or Readwise-deleted source is not this sync's business (its Location still updates, in
+    // the untouched pass below — so its move is used up too).
     let enrol = false;
+    let undecided = false;
     const reason = enrolEvent(doneStateOf(source.external_id, ctx), storedLocation);
     if (reason) {
       const blocker = await incrementalBlocker(es.rem);
-      if (blocker === 'unreadable')
-        log?.log('plan', `  could not read whether "${es.name}" is already incremental — not offered this run.`);
+      if (blocker === 'unreadable') {
+        // Undecided, so this run writes no new Location either: that would use the move (or the
+        // first-sync retry) up without an enrolment, for good (review finding 2, 2026-11-25).
+        undecided = true;
+        log?.log('plan', `  could not read whether "${es.name}" is already incremental — not offered this run, and its Location is left as it is until a sync can tell.`);
+      }
       enrol = stage(blocker === undefined, es.rem._id);
-      if (enrol) toMakeIncremental.push({ id: `mi:${es.rem._id}`, name: es.name, rem: es.rem, reason });
+      if (enrol)
+        toMakeIncremental.push({ id: `mi:${es.rem._id}`, name: es.name, rem: es.rem, reason, location: desiredLocation(source, ctx).label });
     }
+    const changes = undecided ? diffed.filter((c) => c.field !== 'location') : diffed;
+    if (changes.length) toUpdateSources.push({ id: `su:${es.rem._id}`, name: es.name, rem: es.rem, source, changes });
     if (!changes.length && !newHls.length && !supplementsByRemId.has(es.rem._id) && !enrol)
       alreadyInSync.push({ id: `k:${es.rem._id}`, name: es.name });
     await yieldToHost(); // the repair pass added slot reads per source; keep the iframe breathing
@@ -2071,11 +2112,16 @@ async function createSourceDoc(
   powerupRem: PluginRem,
   syncedAt: number,
   log?: SyncLog
-): Promise<{ hlFailed: number; enrolled: boolean }> {
+): Promise<{ hlFailed: number; enrolled: boolean; enrolFailed: boolean }> {
   const s = entry.source;
   const rem = await plugin.rem.createRem();
   if (!rem) throw new Error('createRem returned undefined for a source');
   const added = new Set<string>();
+  // `readerWhenArchived` mode: a doc enrolled at its first sync gets its Location only once that
+  // enrolment has been carried out — see the Location comment below.
+  const holdLocation = entry.makeIncremental && ctx.incMode === 'readerWhenArchived';
+  /** How many ids the ledger slot holds: what the last SUCCESSFUL write recorded (review finding 3). */
+  let recorded = 0;
   try {
     // Parent FIRST: under Sources/ (→ the Readwise root) the doc is deletable, so the rollback below
     // can always clean up — a bare createRem() lives outside the manifest's Delete scope.
@@ -2095,7 +2141,6 @@ async function createSourceDoc(
     // (below): the Location is what tells later syncs where the doc was, so an empty one is how a
     // failed first-sync enrolment is offered again (`IncrementalReason` 'first').
     const loc = desiredLocation(s, ctx);
-    const holdLocation = entry.makeIncremental && ctx.incMode === 'readerWhenArchived';
     if (loc.known && !holdLocation) await writeLocation(plugin, ctx, rem, loc.label);
     await writeLink(plugin, rem, linkOf(s, ctx));
     await writeReadwiseUrls(plugin, rem, readwiseUrlsOf(s, ctx));
@@ -2117,6 +2162,19 @@ async function createSourceDoc(
 
     let hlFailed = 0;
     let sinceCheckpoint = 0;
+    /** Write the ledger. A failure (after `writeLedger`'s own retry) THROWS: it stops the create, so no
+     *  more than LEDGER_CHECKPOINT highlights go unrecorded (review finding 3, 2026-11-25). */
+    const checkpoint = async (): Promise<void> => {
+      try {
+        await writeLedger(rem, added, log);
+      } catch (err) {
+        throw new Error(
+          `ledger checkpoint failed (${errMsg(err)}) — stopped after ${added.size} highlight(s), at most ${sinceCheckpoint} of them unrecorded`
+        );
+      }
+      recorded = added.size;
+      sinceCheckpoint = 0;
+    };
     for (const h of entry.eligible) {
       try {
         await addHighlight(plugin, rem, h, ctx.applyColors, pos, log);
@@ -2129,14 +2187,8 @@ async function createSourceDoc(
       }
       // OUTSIDE the per-highlight try: a failed checkpoint is not a failed highlight (the bullet is
       // written and in `added`), and counting it as one tells the user to retry work that succeeded.
-      if (sinceCheckpoint >= LEDGER_CHECKPOINT) {
-        try {
-          await writeLedger(rem, added, log);
-          sinceCheckpoint = 0;
-        } catch (err) {
-          log?.log('apply', `  ledger checkpoint failed (${errMsg(err)}) — retrying at the next one.`);
-        }
-      }
+      // It does stop the create (see `checkpoint`).
+      if (sinceCheckpoint >= LEDGER_CHECKPOINT) await checkpoint();
       await yieldToHost(); // breathe between highlights too — one big book is otherwise a tight burst
     }
 
@@ -2155,30 +2207,27 @@ async function createSourceDoc(
           hlFailed += 1;
           log?.log('apply', `  supplement ${h.id} failed (will retry next run): ${errMsg(err)}`);
         }
-        // OUTSIDE the try, as in the own-highlight loop: a failed checkpoint is not a failed supplement.
-        if (sinceCheckpoint >= LEDGER_CHECKPOINT) {
-          try {
-            await writeLedger(rem, added, log);
-            sinceCheckpoint = 0;
-          } catch (err) {
-            log?.log('apply', `  ledger checkpoint failed (${errMsg(err)}) — retrying at the next one.`);
-          }
-        }
+        // OUTSIDE the try, as in the own-highlight loop: a failed checkpoint is not a failed supplement,
+        // but it stops the create.
+        if (sinceCheckpoint >= LEDGER_CHECKPOINT) await checkpoint();
         await yieldToHost();
       }
     }
     await writeLedger(rem, added, log);
+    recorded = added.size;
     await stampSyncedAt(rem, syncedAt, log);
     // Decided at plan time (and shown on the row): every create in `always` mode; in
     // `readerWhenArchived` mode all but a Reader source still being read (or one the sweep missed).
-    // Never fails the row — the doc is complete either way.
+    // Never fails the row — the doc is complete either way — but a failure is counted for the toast.
     let enrolled = false;
+    let enrolFailed = false;
     if (holdLocation) {
       let settled = false;
       try {
         enrolled = await enrolIncremental(plugin, rem, ctx, log);
         settled = true;
       } catch (err) {
+        enrolFailed = true;
         log?.log(
           'apply',
           `  could not make "${entry.name}" incremental (${errMsg(err)}) — its Location is left empty, so the next sync offers it again.`
@@ -2191,32 +2240,43 @@ async function createSourceDoc(
           log?.log('apply', `  Location not written (${errMsg(err)}) — the next sync fills it in.`);
         }
       }
-    } else if (entry.makeIncremental) enrolled = await makeIncremental(plugin, rem, ctx, log);
-    return { hlFailed, enrolled };
+    } else if (entry.makeIncremental) {
+      const r = await makeIncremental(plugin, rem, ctx, log);
+      enrolled = r === 'enrolled';
+      enrolFailed = r === 'failed';
+    }
+    return { hlFailed, enrolled, enrolFailed };
   } catch (err) {
     // Once highlights have landed, KEEP the doc whenever its ledger can be written (review finding,
     // 2026-11-24). Rolling back threw away finished work — a late throw (the Supplements header, say)
     // deleted a complete book — and one remove() of a big doc raises RemNote's "type 'delete' to
     // confirm" dialog, which a plugin cannot answer: the call HANGS, and so does the apply. The doc has
     // its identity already (written before any highlight), so the next sync finds it and adds only what
-    // its ledger lacks. If the ledger itself cannot be written, a SMALL doc is still rolled back — far
-    // below that dialog, and keeping it would re-copy every highlight next run — while a big one is kept
-    // anyway: its last checkpoint bounds the re-copy to LEDGER_CHECKPOINT − 1 highlights.
+    // its ledger lacks. If the ledger cannot be written now, the slot still holds what the last checkpoint
+    // recorded: keep the doc when one landed — a failed checkpoint stops the create, so at most
+    // LEDGER_CHECKPOINT highlights are unrecorded and copied again next run (review finding 3,
+    // 2026-11-25; the old test, "at least LEDGER_CHECKPOINT added", assumed checkpoints that may have
+    // failed) — and roll it back when none did: it is SMALL then (no more than LEDGER_CHECKPOINT
+    // highlights), far below that dialog, and keeping it would re-copy every highlight next run.
     let keep = false;
     if (added.size) {
       try {
         await writeLedger(rem, added, log);
         keep = true;
       } catch {
-        keep = added.size >= LEDGER_CHECKPOINT;
+        keep = recorded > 0;
       }
     }
     if (keep) {
       log?.log('apply', `  kept the doc for "${entry.name}" (${added.size} highlight(s) already copied) — the next sync adds what is missing.`);
+      // `always` mode has no first-sync retry, so a kept doc would be enrolled only once it gains another
+      // highlight: enrol it now (review finding 5, 2026-11-25). In `readerWhenArchived` mode its Location
+      // was held back, so the next sync offers it as an unfinished first sync instead.
+      if (entry.makeIncremental && !holdLocation) await makeIncremental(plugin, rem, ctx, log);
     } else {
       try {
-        // Nothing copied yet (or only a few, unrecorded): the doc is small — properties, body bullets and
-        // under LEDGER_CHECKPOINT highlights — so one remove() is safe.
+        // Nothing copied yet, or a few and none recorded: the doc is small — properties, body bullets and
+        // no more than LEDGER_CHECKPOINT highlights — so one remove() is safe.
         // remove() DOES cascade inside the manifest's delete scope — verified 2026-09-05 by removing a
         // real source document: its highlight bullet, that bullet's note child and all seven property
         // rems were gone afterwards. (An earlier note here claimed the opposite; that probe had used a
@@ -2248,7 +2308,8 @@ async function applyAddHighlights(
   let added = 0;
   let failed = 0;
   let sinceCheckpoint = 0;
-  for (const h of highlights) {
+  for (let i = 0; i < highlights.length; i += 1) {
+    const h = highlights[i];
     if (ledger.has(String(h.id))) continue;
     try {
       await addHighlight(plugin, rem, h, applyColor, pos, log);
@@ -2260,13 +2321,14 @@ async function applyAddHighlights(
       failed += 1;
       log?.log('apply', `  highlight ${h.id} failed (will retry next run): ${errMsg(err)}`);
     }
-    // OUTSIDE the try: a failed checkpoint is not a failed highlight.
+    // OUTSIDE the try: a failed checkpoint is not a failed highlight — but it stops the row.
     if (sinceCheckpoint >= LEDGER_CHECKPOINT) {
       try {
         await writeLedger(rem, ledger, log);
         sinceCheckpoint = 0;
       } catch (err) {
-        log?.log('apply', `  ledger checkpoint failed (${errMsg(err)}) — retrying at the next one.`);
+        failed += stopAfterFailedCheckpoint(highlights, i, ledger, err, log);
+        break;
       }
     }
     await yieldToHost(); // breathe between highlights too — one big source is otherwise a tight burst
@@ -2274,7 +2336,7 @@ async function applyAddHighlights(
   try {
     await writeLedger(rem, ledger, log);
   } catch (err) {
-    // The highlights ARE in RemNote but (up to LEDGER_CHECKPOINT-1 of them) not recorded — say so.
+    // The highlights ARE in RemNote but (no more than LEDGER_CHECKPOINT of them) not recorded — say so.
     log?.log('apply', `  WARNING: the ledger for this source could not be written (${errMsg(err)}); up to ${sinceCheckpoint} just-added highlight(s) are unrecorded and would be re-added (duplicated) next run — delete the last ${sinceCheckpoint} bullet(s) first, or re-run and remove the duplicates.`);
     throw err;
   }
@@ -2299,7 +2361,8 @@ async function applyAddSupplements(
   let added = 0;
   let failed = 0;
   let sinceCheckpoint = 0;
-  for (const h of highlights) {
+  for (let i = 0; i < highlights.length; i += 1) {
+    const h = highlights[i];
     if (ledger.has(String(h.id))) continue;
     try {
       await addHighlight(plugin, supRem, h, applyColor, pos, log);
@@ -2311,13 +2374,14 @@ async function applyAddSupplements(
       failed += 1;
       log?.log('apply', `  supplement ${h.id} failed (will retry next run): ${errMsg(err)}`);
     }
-    // OUTSIDE the try: a failed checkpoint is not a failed supplement.
+    // OUTSIDE the try: a failed checkpoint is not a failed supplement — but it stops the row.
     if (sinceCheckpoint >= LEDGER_CHECKPOINT) {
       try {
         await writeLedger(rem, ledger, log);
         sinceCheckpoint = 0;
       } catch (err) {
-        log?.log('apply', `  ledger checkpoint failed (${errMsg(err)}) — retrying at the next one.`);
+        failed += stopAfterFailedCheckpoint(highlights, i, ledger, err, log);
+        break;
       }
     }
     await yieldToHost();
@@ -2338,7 +2402,8 @@ async function applyAddSupplements(
  * up-front (zero changes) if the powerup isn't registered (plugin not reloaded). Per-row `onItemDone`
  * for progress. `failed` counts ROWS that threw; `highlightsFailed` counts individual highlights that
  * failed inside an otherwise-successful row (left out of the ledger, so the next sync re-stages them);
- * `madeIncremental` counts every doc enrolled in Incremental Everything, ride-alongs included.
+ * `madeIncremental` counts every doc enrolled in Incremental Everything, ride-alongs included, and
+ * `enrolFailed` the ride-along enrolments that failed inside a row that otherwise worked.
  */
 export async function applySyncPlan(
   plugin: RNPlugin,
@@ -2358,6 +2423,9 @@ export async function applySyncPlan(
   foldedLookups: number;
   /** Docs enrolled in Incremental Everything: `toMakeIncremental` rows plus create/add ride-alongs. */
   madeIncremental: number;
+  /** Ride-along enrolments that failed inside a create / add row that otherwise worked (the row shows ✅,
+   *  so the toast says it separately). A failed `toMakeIncremental` row is in `failed` instead. */
+  enrolFailed: number;
   failed: number;
 }> {
   const onItemDone = callbacks.onItemDone ?? (() => {});
@@ -2380,7 +2448,12 @@ export async function applySyncPlan(
   let merged = 0;
   let foldedLookups = 0;
   let madeIncremental = 0;
+  let enrolFailed = 0;
   let failed = 0;
+  const countEnrolment = (r: 'enrolled' | 'not-needed' | 'failed'): void => {
+    if (r === 'enrolled') madeIncremental += 1;
+    else if (r === 'failed') enrolFailed += 1;
+  };
 
   log?.section('Apply');
 
@@ -2443,7 +2516,7 @@ export async function applySyncPlan(
       // existing source that just gained ≥1 highlight gets enrolled — `always` mode only (a
       // `readerWhenArchived` doc is enrolled once, at its first sync or on its move into the Archive).
       // makeIncremental re-checks for a doc already incremental or dismissed, and never throws.
-      if (added > 0 && entry.makeIncremental && (await makeIncremental(plugin, entry.rem, ctx, log))) madeIncremental += 1;
+      if (added > 0 && entry.makeIncremental) countEnrolment(await makeIncremental(plugin, entry.rem, ctx, log));
       onItemDone(entry.id, true);
     } catch (err) {
       failed += 1;
@@ -2460,7 +2533,7 @@ export async function applySyncPlan(
       supplementsAdded += added;
       highlightsFailed += hlFailed;
       // Same enrolment rule as own-highlights: a source that just earned content gets enrolled.
-      if (added > 0 && entry.makeIncremental && (await makeIncremental(plugin, entry.rem, ctx, log))) madeIncremental += 1;
+      if (added > 0 && entry.makeIncremental) countEnrolment(await makeIncremental(plugin, entry.rem, ctx, log));
       onItemDone(entry.id, true);
     } catch (err) {
       failed += 1;
@@ -2477,6 +2550,7 @@ export async function applySyncPlan(
         const r = await createSourceDoc(plugin, ctx, entry, parent, powerupRem, syncedAt, log);
         highlightsFailed += r.hlFailed;
         if (r.enrolled) madeIncremental += 1;
+        if (r.enrolFailed) enrolFailed += 1;
         created += 1;
         onItemDone(entry.id, true);
       } catch (err) {
@@ -2510,40 +2584,45 @@ export async function applySyncPlan(
   // same move again. `?? []` keeps a caller that predates this field (the test suite's selection
   // builders) working.
   for (const entry of selection.toMakeIncremental ?? []) {
+    const held = heldLocation.get(entry.rem._id);
     try {
       log?.log(
         'apply',
         `Making "${entry.name}" incremental (${entry.reason === 'moved' ? 'moved into the Archive' : 'not enrolled at its first sync'}).`
       );
       if (await enrolIncremental(plugin, entry.rem, ctx, log)) madeIncremental += 1;
-      onItemDone(entry.id, true);
     } catch (err) {
       failed += 1;
-      const held = heldLocation.get(entry.rem._id);
       log?.log(
         'apply',
-        `MAKE-INCREMENTAL FAILED for ${entry.name}: ${errMsg(err)}` +
-          (held ? ' — its Location was left as it was, so the next sync offers it again.' : '')
+        `MAKE-INCREMENTAL FAILED for ${entry.name}: ${errMsg(err)} — its Location was left as it was, so the next sync offers it again.`
       );
       onItemDone(entry.id, false);
-      if (held?.alone) onItemDone(held.entry.id, false); // its one field was this Location
+      if (held?.alone) {
+        // Its one ticked field — this Location — was not written either: count it, as its ❌ shows
+        // (review finding 6, 2026-11-25).
+        failed += 1;
+        onItemDone(held.entry.id, false);
+      }
       await yieldToHost();
       continue;
     }
-    const held = heldLocation.get(entry.rem._id);
-    if (held) {
-      try {
-        await applyUpdate(plugin, ctx, held.entry, new Set<UpdatableField>(['location']), syncedAt);
-        if (held.alone) {
-          updated += 1;
-          onItemDone(held.entry.id, true);
-        }
-      } catch (err) {
-        log?.log('apply', `  enrolled, but its Location could not be written (${errMsg(err)}) — the next sync offers that again.`);
-        if (held.alone) {
-          failed += 1;
-          onItemDone(held.entry.id, false);
-        }
+    onItemDone(entry.id, true);
+    // Settled (enrolled, or already incremental / dismissed): record the move so it is not offered
+    // again. THIS row writes the Location, whether or not the update row's Location field was ticked:
+    // the Location is the memory, and an enrolled doc whose move stayed unrecorded would come back once
+    // taken out of IE (review finding 4, 2026-11-25).
+    try {
+      await writeLocation(plugin, ctx, entry.rem, entry.location);
+      if (held?.alone) {
+        updated += 1;
+        onItemDone(held.entry.id, true);
+      }
+    } catch (err) {
+      log?.log('apply', `  enrolled, but its Location could not be written (${errMsg(err)}) — the next sync updates it.`);
+      if (held?.alone) {
+        failed += 1;
+        onItemDone(held.entry.id, false);
       }
     }
     await yieldToHost();
@@ -2553,9 +2632,21 @@ export async function applySyncPlan(
     'apply',
     `Done: ${created} created, ${updated} updated, ${highlightsAdded} highlights + ${supplementsAdded} supplement(s) added ` +
       `(${highlightsFailed} failed), ${mergedDocs} supplement doc(s) merged (${merged} bullet(s) moved), ` +
-      `${foldedLookups} duplicate lookup rem(s) folded, ${madeIncremental} made incremental, ${failed} row(s) failed.`
+      `${foldedLookups} duplicate lookup rem(s) folded, ${madeIncremental} made incremental (${enrolFailed} more failed), ` +
+      `${failed} row(s) failed.`
   );
-  return { created, updated, highlightsAdded, supplementsAdded, highlightsFailed, mergedDocs, foldedLookups, madeIncremental, failed };
+  return {
+    created,
+    updated,
+    highlightsAdded,
+    supplementsAdded,
+    highlightsFailed,
+    mergedDocs,
+    foldedLookups,
+    madeIncremental,
+    enrolFailed,
+    failed,
+  };
 }
 
 // ───────────────────────── Supplement documents: fold one into its main document ──

@@ -299,15 +299,19 @@ export const ReadwiseSync = () => {
             `(${p.orphanDocNames.slice(0, 3).join(', ')}${p.orphanDocNames.length > 3 ? ', …' : ''}) — leftovers of an ` +
             'interrupted create. Delete them by hand, or their sources will be imported a second time.'
         );
-      // "Make source docs Incremental" is on but Incremental Everything is not running. Each doc is
-      // enrolled once, on an event (its first sync, its move into the Archive) — and applying records
-      // that event whether or not anything was enrolled, so these would never be offered again.
+      // "Make source docs Incremental" is on but Incremental Everything is not running. By default each
+      // doc is enrolled once, on an event (its first sync, its move into the Archive), and applying
+      // records that event whether or not anything was enrolled, so these are not offered again; under
+      // the original rule a doc is enrolled later only when it next gains a highlight. "Up to": without
+      // IE running, a doc already in its queue can't be told apart (review finding 8, 2026-11-25).
       if (p.incMissed !== undefined)
         warnings.push(
           p.incMissed > 0
-            ? `Incremental Everything isn't running, so ${p.incMissed} document(s) that should be made Incremental now ` +
-                "won't be — and once you apply, they won't be offered again. To enrol them, enable Incremental " +
-                'Everything, then press Refresh before applying.'
+            ? `Incremental Everything isn't running, so up to ${p.incMissed} document(s) that should be made Incremental now ` +
+                (ctx.incWanted === 'readerWhenArchived'
+                  ? "won't be — and once you apply, they won't be offered again."
+                  : "won't be: new ones won't be enrolled later, and existing ones only when they next gain a highlight.") +
+                ' To enrol them, enable Incremental Everything, then press Refresh before applying.'
             : "Incremental Everything isn't running, so nothing will be made Incremental."
         );
       if (warnings.length) setWarning(warnings.join(' '));
@@ -448,7 +452,14 @@ export const ReadwiseSync = () => {
         (result.mergedDocs ? `, ${result.mergedDocs} supplement document(s) folded in` : '') +
         (result.foldedLookups ? `, ${result.foldedLookups} duplicate lookup rem(s) folded` : '') +
         (result.madeIncremental ? `, ${result.madeIncremental} made Incremental` : '') +
-        (problems.length ? `; ${problems.join(', ')}. Click Refresh to re-check and retry them.` : '.');
+        (problems.length ? `; ${problems.join(', ')}. Click Refresh to re-check and retry them.` : '.') +
+        // A ride-along enrolment that failed leaves its row ✅, so it is said here (review finding 6).
+        (result.enrolFailed
+          ? ` ${result.enrolFailed} document(s) couldn't be made Incremental — ` +
+            (ctx.incMode === 'readerWhenArchived'
+              ? 'Refresh offers them again.'
+              : 'each is enrolled when it next gains a highlight.')
+          : '');
       setStatus(msg);
       await plugin.app.toast(msg);
     } catch (err) {
@@ -714,8 +725,8 @@ export const ReadwiseSync = () => {
               {...sectionProps('inc', incLeafIds)}
             >
               <div style={{ paddingLeft: 16, fontSize: 12, color: '#6b7280' }}>
-                Enrolled in Incremental Everything, due today. Each is offered once: untick one to leave it out, and it
-                won't be offered again.
+                Enrolled in Incremental Everything, due today, and offered only once. Untick one to leave it out: it
+                won't be offered again as long as its Location update, under Will update source, stays ticked.
               </div>
               {plan.toMakeIncremental.map((e) => (
                 <div key={e.id} style={{ ...rowStyle, paddingLeft: 16 }}>
